@@ -1,0 +1,1118 @@
+---
+title: "COVID_mAb_BAL"
+output: html_document
+date: "2024-06-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
+library(Seurat)
+library(SingleR)
+library(stringr)
+library(ggplot2)
+library(SingleCellExperiment)
+library(dplyr)
+library(celldex)
+library(hdf5r)
+library(Matrix)
+library(data.table)
+library(magrittr)
+library(reshape2)
+library(patchwork)
+library(ggplot2)
+library(grid)
+library(patchwork)
+library(colorbrewer)
+library(ggrastr)
+install.packages("celldex")
+install.packages("SingleR")
+
+ref <- BlueprintEncodeData()
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
+y_genes <- as.character(unlist(read.table("Y_genes.txt"),use.names = F))
+mt_genes <-  as.character(unlist(read.table("MT_genes.txt"),use.names = F))
+ig_genes <- as.character(unlist(read.table("IG_genes.txt"),use.names = F))
+tr_genes <- as.character(unlist(read.table("TR_genes.txt"),use.names = F))
+prot_coding <- as.character(unlist(read.table("protein_coding_seurat.txt"),use.names = F))
+
+data_path <- "/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL"  
+
+dirs <- list.dirs(data_path, recursive = FALSE)
+dirs <- dirs[grepl("Mmul10_MT246667", dirs)]
+dirs <- dirs[2:17]
+dirs
+
+```
+
+
+
+```{r preprocessing}
+#QC
+
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL")
+
+list_obj <- list()
+list_obj2 <- list() 
+list_obj3 <- list()
+runQC <- function(path){
+  
+  captureid <- str_extract(path,"s001|s003|s010|s013|s020|s023|s027|s029|s002|s007|s011|s017|s021|s026|s028|s030")
+  timepoint <- ifelse(grepl("D2",path),"2dpi","NX (7 or 8 dpi)")
+  
+  group <- ifelse(grepl("s001|s003|s010|s013|s023|s027|s029", path) ,"Hashes123",
+                  ifelse(grepl("s002|s007|s011|s017|s026|s028|s030", path) ,"Hashes456",
+                         ifelse(grepl("s021", path), "Hashes56",
+                                ifelse(grepl("s020", path), "Hashes12"))))
+ 
+  tissue <- "BAL"
+  
+  s <- paste(tissue,timepoint,group,captureid, sep="_")
+  print(path)
+  print(s)
+  counts <- Read10X_h5(paste0(path,"/outs/per_sample_outs/count/sample_filtered_feature_bc_matrix.h5"))
+  obj <- CreateSeuratObject(counts=counts$`Gene Expression`,project=s)
+  
+  rps_genes <- row.names(obj)[grepl("^RP[S,L]",row.names(obj))]
+  cov2_genes <- row.names(obj)[grepl("SARS-CoV2",row.names(obj))]
+  obj[["percent.cov2"]] <- PercentageFeatureSet(obj, features = cov2_genes)
+  obj[["percent.hbb"]] <- PercentageFeatureSet(obj, pattern = "^HBB")
+  obj[["percent.mito"]] <- PercentageFeatureSet(obj, features = mt_genes)
+  obj[["percent.ig"]] <- PercentageFeatureSet(obj, features = ig_genes)
+  obj[["percent.rps.rpl"]] <- PercentageFeatureSet(obj, features = rps_genes)
+  obj$log10GenesPerUMI <- log10(obj$nFeature_RNA) / log10(obj$nCount_RNA)
+  
+  meta <- obj@meta.data[,c("percent.hbb","percent.mito","percent.rps.rpl","percent.ig","percent.cov2","log10GenesPerUMI")]
+  
+  is_coding <- row.names(obj) %in% prot_coding
+  non_coding <- row.names(obj)[!is_coding]
+  
+  filt_genes <- c("HBB",y_genes, mt_genes, rps_genes, ig_genes, tr_genes, cov2_genes, non_coding)
+  is_filt <- row.names(obj) %in% filt_genes
+  
+  obj <- CreateSeuratObject(counts=counts$`Gene Expression`[!is_filt,])
+  HTO_counts <- counts$`Antibody Capture`
+  if (group == "Hashes123" ) {
+    HTO_counts <- HTO_counts[c(1:3),]}
+  if (group == "Hashes56" ) {
+    HTO_counts <- HTO_counts[c(5:6),]}
+  if (group == "Hashes456" ) {
+    HTO_counts <- HTO_counts[c(4:6),]}
+  if (group == "Hashes12" ) {
+    HTO_counts <- HTO_counts[c(1:2),]}
+  
+  obj[['HTO']]<-CreateAssayObject(counts = HTO_counts)
+  
+  obj$Sample <- s
+  obj$Group <- group
+  obj$Tissue <- tissue
+  obj$Timepoint <- timepoint
+  
+  obj@meta.data <- transform(merge(obj@meta.data, meta, by=0, ln.x=TRUE), row.names=Row.names, Row.names=NULL)
+  
+  
+  p1 <- VlnPlot(obj, features = "nFeature_RNA")
+  out1 <- paste0(s,"_nFeature_QC.png")
+  ggsave(filename =out1, plot = p1, path =path)
+  
+  p2 <- VlnPlot(obj, features = "nCount_RNA")
+  out2<- paste0(s,"_nCount_QC.png")
+  ggsave(filename =out2, plot = p2, path =path)
+  
+  p3 <- VlnPlot(obj, features = "percent.mito")
+  out3<- paste0(s,"_PercentMito_QC.png")
+  ggsave(filename =out3, plot = p3, path =path)
+  
+  p4 <- VlnPlot(obj, features = "percent.hbb")
+  out4<- paste0(s,"_percent_hbb_QC.png")
+  ggsave(filename =out4, plot = p4, path =path)
+  
+  p5 <- VlnPlot(obj, features = "percent.rps.rpl")
+  out5<- paste0(s,"_rps_rpl_QC.png")
+  ggsave(filename =out5, plot = p5, path =path)
+  
+  p6 <- VlnPlot(obj, features = "percent.ig")
+  out6<- paste0(s,"_percent_ig_QC.png")
+  ggsave(filename =out6, plot = p6, path =path)
+  
+  p7 <- VlnPlot(obj, features = "percent.cov2")
+  out7<- paste0(s,"_percentCoV2_QC.png")
+  ggsave(filename =out7, plot = p7, path =path)
+  
+  
+  
+  list_obj[[s]] <<- obj
+  
+}
+
+lapply(dirs,runQC)
+saveRDS(list_obj,"new_prefilter_BAL_list_objects_all.rds")
+```
+
+```{r Run individual samples through Seurat}
+createobj <- function(obj){
+  obj <- subset(obj, subset= (nFeature_RNA >= 200) & (nFeature_RNA <=5000) &
+                  (log10GenesPerUMI >= 0.8) &
+                  (percent.hbb < 10) & 
+                  (percent.mito < 20) & 
+                  (percent.rps.rpl < 25))
+  s <- unique(obj$Sample)
+  
+  p <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA","percent.mito","percent.hbb","percent.rps.rpl","percent.ig"))
+  out <- paste0(s,"_QC_filter.png")
+  ggsave(p,file=out)
+  
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj, selection.method = "vst")
+  obj <- ScaleData(obj)
+  
+  DefaultAssay(obj) <- "RNA"
+  normdata <- GetAssayData(obj, assay="RNA", slot = "data")
+  
+  common <- intersect(row.names(normdata),row.names(ref))
+  
+  ?SCTransform
+  normdata <- normdata[common,]
+  ref <- ref[common,]
+  
+  bp.main <- SingleR(test = normdata, ref = ref,
+                     labels = ref$label.main, assay.type.ref = "logcounts")
+  
+  obj[["BP.main"]] <- bp.main$labels
+  obj[["BP.main.pruned"]] <- bp.main$pruned.labels
+  
+  bp.fine <- SingleR(test = normdata, ref = ref,
+                     labels = ref$label.fine, assay.type.ref = "logcounts")
+  obj[["BP.fine"]] <- bp.fine$labels
+  obj[["BP.fine.pruned"]] <- bp.fine$pruned.labels
+  
+  obj <- CellCycleScoring(obj, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+  
+  obj <- SCTransform(obj, method="glmGamPoi",verbose = FALSE)
+  obj <- RunPCA(obj, verbose = FALSE)
+  obj <- RunUMAP(obj, dims = 1:30, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = 1:30, verbose = FALSE)
+  obj <- FindClusters(obj, verbose = FALSE)
+  
+  p <- DimPlot(obj, label=TRUE) + NoLegend()
+  out <- paste0(s,"_UMAP.png")
+  ggsave(p,file=out)
+  
+  Idents(obj) <- "SingleR"
+  p <- DimPlot(obj, label=TRUE)
+  out <- paste0(s,"_SingleR_UMAP.png")
+  ggsave(p,file=out)
+  
+  list_obj2[[s]] <<- obj
+}
+
+lapply(list_obj,createobj)
+saveRDS(list_obj2,"BAL_list_objects_all.rds")
+
+
+```
+
+```{r Demultiplexing}
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL")
+runDEMUX <- function(obj){
+  s <- unique(obj$Sample)
+  DefaultAssay(obj) = "HTO"
+  
+  obj <- NormalizeData(obj, assay = "HTO", normalization.method = "CLR")
+  obj <- HTODemux(obj, assay = "HTO", positive.quantile = 0.99)
+  
+  print(table(obj$HTO_classification.global))
+  
+  Idents(obj) <- "HTO_classification.global"
+  obj <- subset(obj, idents = "Singlet")
+  hto.dist.mtx <- as.matrix(dist(t(GetAssayData(object = obj, assay = "HTO"))))
+  Idents(obj) <- "HTO_classification"
+  obj <- RunTSNE(obj, distance.matrix = hto.dist.mtx, perplexity = 10)
+  
+  Idents(obj) <- "HTO_maxID"
+  
+  p1 <- DimPlot(obj, group.by = "HTO_maxID")
+  out <- paste0(s,"_HTO_singlet.png")
+  ggsave(p1,file=out)
+  
+  p2<- RidgePlot(obj, assay = "HTO", features = rownames(obj[["HTO"]])[1:3], ncol = 1, stack = TRUE)
+  out <- paste0(s,"_Ridge_singlet1.png")
+  ggsave(p2,file=out)
+  
+  
+  
+  list_obj3[[s]] <<- obj
+  print("Finished HTO")  
+  
+}  
+lapply(list_obj2,runDEMUX)
+
+lapply(list_obj,createobj)
+saveRDS(list_obj3,"BAL_dmux.rds")
+
+```
+
+```{r Integration}
+list_obj3 <- SplitObject(list_obj3, split.by = "Sample")
+list_obj3.list <- lapply(X = list_obj3, FUN = SCTransform, method = "glmGamPoi")
+int.features <- SelectIntegrationFeatures(object.list = list_obj3.list, normalization.method = "SCT",nfeatures = 3000) 
+list_obj3.list <- PrepSCTIntegration(list_obj3.list, anchor.features = int.features, verbose = FALSE)
+list_obj3.list <- lapply(X = list_obj3.list, FUN = RunPCA, features = int.features)
+
+BAL_Anchors <- FindIntegrationAnchors(list_obj3.list, normalization.method = "SCT", reduction = "rpca", anchor.features = int.features, verbose = FALSE)
+saveRDS(BAL_Anchors, "BAL_Anchors.rds",dims = 1:30)
+
+
+DefaultAssay(BAL_int) <- "integrated"
+  BAL_int <- IntegrateData(anchorset = BAL_Anchors, normalization.method = "SCT", dims = 1:30, verbose = TRUE)
+  BAL_int <- RunPCA(BAL_int, verbose = FALSE)
+  BAL_int <- RunUMAP(BAL_int, reduction = "pca", dims = 1:30)
+  BAL_int <- FindNeighbors(BAL_int, dims = 1:30, verbose = FALSE)
+  BAL_int <- FindClusters(BAL_int, verbose = FALSE)
+  Idents(BAL_int) <- "BP.main"
+  BAL_int$Manual = "NA"
+  plot <- DimPlot(BAL_int, group.by ="BP.main" ,label = FALSE)
+  plot
+  
+  saveRDS(BAL_int, "BAL_int.rds")
+
+  
+  p1a <- DimPlot(BAL_int, group.by = "BP.main", label = T)
+  p2a <- DimPlot(BAL_int, group.by = "integrated_snn_res.0.5", label= T)
+  p3a<-p2a+p1a
+  p3a
+  
+```
+
+```{r Preliminary BAL annotation}
+ 
+  DefaultAssay(BAL_int) <- "RNA"
+  Idents(BAL_int) <- "integrated_snn_res.0.5"
+  p1b <- DimPlot(BAL_int, label = T) & NoAxes() & NoLegend() 
+  p2b <- DotPlot(BAL_int,features = c("CD163","CD68","APOE","CD3D","CD3E","NKG7","CCR7","LAMP3","MARCKSL1","KIT","FCER1A","CST6","TPPP3","LRRIQ1","FLT3","CD1C","CLEC9A","CCDC50","SELL","IRF8","MS4A1","CD79A","SCGB3A1","SCGB1A1","GZMB","MAMU-DRA","MAMU-DRB1","IL1RN","IFIT3","SOD2","CSF3R","MARCO","CHIT1","MRC1","TREM2","APOBEC3A","CD14","FCGR3")) + RotatedAxis() +
+    theme(axis.text.x = element_text(color = "black",size = 11, angle = 45, hjust = 1))
+  p1b + p2b +  plot_layout(widths = c(1, 2))
+  
+  baldotplotdata<- p2b$data
+  
+  
+  saveRDS(BAL_int,"bal_reciprocal_dim30.rds")
+  BAL_int <- bal_reciprocal_dim30
+  
+  desired_order <- c("Macrophages and Monocytes", "T/NK cells", "B cells", "Activated cDC", "cDC1", "cDC2", "pDC", "Neutrophils", "Mast", "Epithelial")
+ 
+  BAL_int$Manual <- factor(BAL_int$Manual, levels = desired_order)
+  
+  # set this as the active identity class for your Seurat object
+  BAL_int$Manual2 = "NA"
+  Idents(BAL_int) <- BAL_int$Manual
+ 
+  BAL_int$Manual2 <- factor(BAL_int$integrated_snn_res.0.5, levels = c(1:25))
+                         
+  Idents(BAL_int) <- "Manual"
+  
+  p3b<- DotPlot(BAL_int,features = c("CD163","CD68","APOE","CD3D","CD3E","NKG7","CCR7","LAMP3","MARCKSL1","KIT","FCER1A","CST6","TPPP3","LRRIQ1","FLT3","CD1C","CLEC9A","CCDC50","SELL","IRF8","MS4A1","CD79A","SCGB3A1","SCGB1A1","GZMB","MAMU-DRA","MAMU-DRB1","IL1RN","IFIT3","SOD2","CSF3R","MARCO","CHIT1","MRC1","TREM2","APOBEC3A","CD14","FCGR3")) + RotatedAxis() +
+    theme(axis.text.x = element_text(color = "black",size = 11, angle = 45, hjust = 1))
+  p3b
+  
+  p3b<- DotPlot(BAL_int,features = c("CD163","APOE","CD68","CD14","CHIT1","MARCO", "IL1RN","IFIT3","SOD2","CSF3R","APOBEC3A", "FCGR3","MRC1","TREM2", "CD3D","CD3E","NKG7","CCDC50","SELL","IRF8","CCR7","CD79A","LAMP3","MARCKSL1","FLT3","CD1C","MAMU-DRA","MAMU-DRB1","MS4A1","KIT","FCER1A","CST6","TPPP3","LRRIQ1","GZMB", "CLEC9A")) + RotatedAxis() +
+    theme(axis.text.x = element_text(color = "black",size = 11, angle = 45, hjust = 1))
+  p3b
+  baldotplotdata2<- p3b$data
+ 
+   BAL_int$Type1 <- "Myeloid"
+
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 19] <- "Lymphocytes"
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 24] <- "Lymphocytes"
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 7] <- "Lymphocytes"
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 16] <- "Lymphocytes"
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 20] <- "Lymphocytes"
+  BAL_int$Type1[BAL_int$integrated_snn_res.0.5 == 23] <- "Epithelial"
+  
+  
+# Manually select macrophages/monocytes
+
+BAL_int$Manual = "NA"
+plot <- DimPlot(BAL_int, group.by = "BP.main", label = TRUE)
+select.cells <- CellSelector(plot = plot)
+BAL_int@meta.data[select.cells,]$Manual <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 0] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 1] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 2] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 3] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 4] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 5] <- "Neutrophils"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 6] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 8] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 9] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 10] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 11] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 12] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 13] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 14] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 21] <- "Macrophages and Monocytes"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 19] <- "T/NK cells"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 24] <- "T/NK cells"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 7] <- "T/NK cells"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 16] <- "T/NK cells"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 20] <- "B cells"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 23] <- "Epithelial"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 22] <- "Mast"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 15] <- "pDC"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 18] <- "cDC2"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 25] <- "cDC1"
+BAL_int$Manual[BAL_int$integrated_snn_res.0.5 == 17] <- "Activated cDC"
+
+BAL_int$Manual[BAL_int$BP.main == "Neutrophils"] <- "Neutrophils"
+
+BAL_int$Manual<- factor(BAL_int$Manual)
+
+p1 <- DimPlot(BAL_int, group.by = "BP.main", label = TRUE)
+p2 <- DimPlot(BAL_int, group.by = "Manual", label = TRUE, raster = TRUE)
+
+p1+p2
+DimPlot(BAL_int, group.by = "Manual", split.by = "BP.main", ncol = 4)
+saveRDS(BAL_int,"BAL_int.rds")
+```
+
+```{r DE}
+animalIDValues <- BAL_int$Sample[]
+dose<- character(length = 107830)
+
+for (i in 1:107830) {
+  nAnimalID <- animalIDValues[i]
+  if (is.na(nAnimalID)) {
+    dose[i] <- NA  
+  } else if (grepl("LM65|RVo18|RWo17|RJr18|RHv18|RAu18", nAnimalID)) {
+    dose[i] <- "PGT121"
+  } else if (grepl("RPb19|RNw18|RZn18|RJn18|RIn18|LM98", nAnimalID)) {
+    dose[i] <- "40.8_10mg"
+  } else if (grepl("RIL18|MB11|RBt18|RYu18|LL60|RGu18", nAnimalID)) {
+    dose[i] <- "40.8_1mg"
+  } else if (grepl("RWj18|RFu18|ROk18|RIr18|RUv18|ROt18", nAnimalID)) {
+    dose[i] <- "40.8_0.1mg"
+  }
+}
+
+BAL_int$Group <- "NA"
+BAL_int$Group <- dose
+
+BAL_int$Type_Group <- paste0(BAL_int$Manual,"_",BAL_int$Group)
+Idents(BAL_int) <- "Type_Group" 
+DefaultAssay(BAL_int) <- "RNA"
+
+
+
+BAL_list_de01 <- list()
+BAL_list_de01_sig <- list()
+BAL_list_de1 <- list()
+BAL_list_de1_sig <- list()
+BAL_list_de10 <- list()
+BAL_list_de10_sig <- list()
+BAL_list_de101 <- list()
+BAL_list_de101_sig <- list()
+
+get_de <- function(type){
+  
+  print(type)
+  
+  BAL_de01 <- FindMarkers(BAL_int, ident.1 = paste0(type,"_PGT121"), ident.2= paste0(type,"_40.8_0.1mg"), test.use = "MAST")
+  BAL_de1 <- FindMarkers(BAL_int, ident.1 = paste0(type,"_PGT121"), ident.2= paste0(type,"_40.8_1mg"), test.use = "MAST")
+  BAL_de10 <- FindMarkers(BAL_int, ident.1 = paste0(type,"_PGT121"), ident.2= paste0(type,"_40.8_10mg"), test.use = "MAST")
+  BAL_de101 <- FindMarkers(BAL_int, ident.1 = paste0(type,"_40.8_10mg"), ident.2= paste0(type,"_40.8_0.1mg"), test.use = "MAST")
+  
+  write.table(BAL_de01,paste0(type),quote=F,sep="\t")
+  BAL_list_de01[[paste0(type)]] <<- BAL_de01
+  
+  BAL_de01 <- BAL_de01[BAL_de01$p_val_adj < 0.05 & abs(BAL_de01$avg_log2FC) >= log2(1.5),]
+  BAL_de01 <- BAL_de01[order(BAL_de01$avg_log2FC,decreasing = T),]
+  write.table(BAL_de01,paste0(type),quote=F,sep="\t")
+  BAL_list_de01_sig[[paste0(type)]] <<- BAL_de01
+  
+  write.table(BAL_de1,paste0(type),quote=F,sep="\t")
+  BAL_list_de1[[paste0(type)]] <<- BAL_de1
+  
+  BAL_de1 <- BAL_de1[BAL_de1$p_val_adj < 0.05 & abs(BAL_de1$avg_log2FC) >= log2(1.5),]
+  BAL_de1 <- BAL_de1[order(BAL_de1$avg_log2FC,decreasing = T),]
+  write.table(BAL_de1,paste0(type),quote=F,sep="\t")
+  BAL_list_de1_sig[[paste0(type)]] <<- BAL_de1
+  
+  write.table(BAL_de10,paste0(type),quote=F,sep="\t")
+  BAL_list_de10[[paste0(type)]] <<- BAL_de10
+  
+  BAL_de10 <- BAL_de10[BAL_de10$p_val_adj < 0.05 & abs(BAL_de10$avg_log2FC) >= log2(1.5),]
+  BAL_de10 <- BAL_de10[order(BAL_de10$avg_log2FC,decreasing = T),]
+  write.table(BAL_de10,paste0(type),quote=F,sep="\t")
+  BAL_list_de10_sig[[paste0(type)]] <<- BAL_de10
+  
+  write.table(BAL_de101,paste0(type),quote=F,sep="\t")
+  BAL_list_de101[[paste0(type)]] <<- BAL_de101
+  
+  BAL_de101 <- BAL_de101[BAL_de101$p_val_adj < 0.05 & abs(BAL_de101$avg_log2FC) >= log2(1.5),]
+  BAL_de101 <- BAL_de101[order(BAL_de101$avg_log2FC,decreasing = T),]
+  write.table(BAL_de101,paste0(type),quote=F,sep="\t")
+  BAL_list_de101_sig[[paste0(type)]] <<- BAL_de101
+  
+}
+
+
+
+lapply(sort(unique(BAL_int$Manual)),get_de)
+saveRDS(BAL_list_de01,"BAL_list_de1.rds")
+saveRDS(BAL_list_de01_sig,"BAL_list_de1_sig.rds")
+saveRDS(BAL_list_de1,"BAL_list_de1.rds")
+saveRDS(BAL_list_de1_sig,"BAL_list_de1_sig.rds")
+saveRDS(BAL_list_de10,"BAL_list_de10.rds")
+saveRDS(BAL_list_de10_sig,"BAL_list_de10_sig.rds")
+saveRDS(BAL_list_de101,"BAL_list_de101.rds")
+saveRDS(BAL_list_de101_sig,"BAL_list_de101_sig.rds")
+
+write.xlsx(BAL_list_de01, file = "DE_single-cell_BAL_Control_vs_01.xlsx", rowNames=T)
+write.xlsx(BAL_list_de01_sig, file = "DE_single-cell_BAL_Control_vs_01_sig.xlsx", rowNames=T)
+write.xlsx(BAL_list_de1, file = "DE_single-cell_BAL_Control_vs_1.xlsx", rowNames=T)
+write.xlsx(BAL_list_de1_sig, file = "DE_single-cell_BAL_Control_vs_1_sig.xlsx", rowNames=T)
+write.xlsx(BAL_list_de10, file = "DE_single-cell_BAL_Control_vs_10.xlsx", rowNames=T)
+write.xlsx(BAL_list_de10_sig, file = "DE_single-cell_BAL_Control_vs_10_sig.xlsx", rowNames=T)
+write.xlsx(BAL_list_de101, file = "DE_single-cell_BAL_10_vs_1.xlsx", rowNames=T)
+write.xlsx(BAL_list_de101_sig, file = "DE_single-cell_BAL_10_vs_1_sig.xlsx", rowNames=T)
+
+
+```
+
+
+```{r Split and integrate all samples again}
+
+bal_macro_mono <- readRDS("BAL_macro_mono.rds")
+
+list_bal_myeloid <- SplitObject(bal_macro_mono, split.by = "Sample")
+for (i in names(list_bal_myeloid)) {
+  DefaultAssay(list_bal_myeloid[[i]]) <- "RNA"
+  list_bal_myeloid[[i]]  <- DietSeurat(list_bal_myeloid[[i]], counts = TRUE, data = TRUE, scale.data = FALSE, assays = "RNA")
+  list_bal_myeloid[[i]] <- SCTransform(list_bal_myeloid[[i]], method = "glmGamPoi", verbose = FALSE)
+}
+
+bal_myeloid_int.features <- SelectIntegrationFeatures(object.list = list_bal_myeloid, normalization.method = "SCT",nfeatures = 3000) 
+bal_myeloid_int.list <- PrepSCTIntegration(list_bal_myeloid, anchor.features = bal_myeloid_int.features, verbose = FALSE)
+bal_myeloid_int.list <- lapply(X = bal_myeloid_int.list, FUN = RunPCA, features = int.features)
+
+bal_myeloid_anchors <- FindIntegrationAnchors(bal_myeloid_int.list, normalization.method = "SCT", reduction = "rpca", anchor.features = bal_myeloid_int.features, verbose = FALSE)
+bal_myeloid_int <- IntegrateData(anchorset = bal_myeloid_anchors, normalization.method = "SCT", verbose = FALSE)
+DefaultAssay(bal_myeloid_int) <- "integrated"
+bal_myeloid_int <- RunPCA(bal_myeloid_int, verbose = FALSE)
+bal_myeloid_int <- RunUMAP(bal_myeloid_int, dims = 1:30,reduction = "pca", verbose = FALSE)
+bal_myeloid_int <- FindNeighbors(bal_myeloid_int, dims = 1:30, verbose = FALSE)
+bal_myeloid_int <- FindClusters(bal_myeloid_int, verbose = FALSE, resolution = 0.1)
+
+DimPlot(bal_myeloid_int,group.by = "BP.main")
+DimPlot(bal_myeloid_int,group.by = "seurat_clusters")
+
+saveRDS(bal_myeloid_int,"BAL_myeloid_int.rds")
+saveRDS(list_bal_myeloid,"list_bal_myeloid.rds")
+
+
+BAL_myeloid_int <- readRDS("BAL_myeloid_int.rds")
+list_bal_myeloid <- readRDS("list_bal_myeloid.rds")
+
+DefaultAssay(BAL_myeloid_int) <- "RNA"
+BAL_myeloid_int <- NormalizeData(BAL_myeloid_int)
+BAL_myeloid_int <- FindVariableFeatures(BAL_myeloid_int, selection.method = "vst")
+BAL_myeloid_int <- ScaleData(BAL_myeloid_int)
+
+saveRDS(BAL_myeloid_int,"BAL_myeloid_int_scaled.rds")
+
+
+BAL_markers <- FindAllMarkers(BAL_myeloid_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+saveRDS(BAL_markers,"BAL_markers.rds")
+
+BAL_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10
+heatmap<-DoHeatmap(BAL_myeloid_int_scaled, features = top10$gene)
+
+BAL_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC) -> top5
+heatmap5 <-DoHeatmap(BAL_myeloid_int_scaled, features = top5$gene) 
+
+heatmap5
+ggsave("heatmap.pdf", heatmap5, width = 8, height = 6)
+
+
+violin_plot2 <- VlnPlot(BAL_myeloid_int_scaled,c("CD163","MRC1","FABP4","TREM2","S100A8","CD14","FCGR3","FCER1A","CD1C","GZMB","FLT3","CLEC9A"), pt.size = 0)
+ggsave("violin_plot2.pdf", violin_plot2, width = 8, height = 6)
+
+
+```
+
+```{r Reference for mapping}
+
+lungs_ref <- readRDS("/yerkes-cifs/runs/Analysis/COVID_NHP_Study1/R4_10X_Seuratv4_v2/Lung/Lungs_int3.rds")
+DefaultAssay(lungs_ref) <- "integrated"
+lungs_ref <- RunUMAP(lungs_ref, dims = 1:30, reduction = "pca", return.model = TRUE)
+
+lungs_ref$celltype[lungs_ref$celltype == "CD163+MRC1+\nMac"] <- "CD163+MRC1+ Mac"
+lungs_ref$celltype[lungs_ref$celltype == "CD163+MRC1+\nTREM2+ Mac"] <- "CD163+MRC1+TREM2+ Mac"
+lungs_ref$celltype[lungs_ref$celltype == "CD163+MRC1-\nMac"] <- "CD163+MRC1- Mac"
+lungs_ref$celltype[lungs_ref$celltype == "CD16+\nMono"] <- "CD16+ Mono"
+lungs_ref <- SCTransform(lungs_ref)
+# Map lungs reference
+
+BAL_transfer_Anchors <- FindTransferAnchors(
+  reference = lungs_ref,
+  query = BAL_myeloid_int,
+  reference.reduction = "pca",
+  dims = 1:30,
+  normalization.method = "SCT"
+)
+
+BAL_query <- MapQuery(
+  anchorset = BAL_transfer_Anchors, 
+  query = BAL_myeloid_int,
+  reference = lungs_ref,
+  refdata = list(celltype = "celltype"),
+  reference.reduction = "pca",
+  reduction.model = "umap"
+)
+
+DefaultAssay(BAL_query) <- "RNA"
+BAL_query <- NormalizeData(BAL_query)
+BAL_query <- FindVariableFeatures(BAL_query, selection.method = "vst")
+BAL_query <- ScaleData(BAL_query)
+
+saveRDS(BAL_query,"BAL_query.rds")
+
+```
+
+```{r Labeling Demultiplexed Samples}
+#Adding Animal ID column, denoting Animal ID based on Hash
+animalIDs <- c("RWo17", "RVo18", "RWj18","LM65","RIL18","RPb19","RNw18","MB11","RJr18","RIn18","RBt18","RUv18","RFu18","RYu18","RZn18","ROk18","LL60","RHv18","RJn18","RAu18","RIr18","RGu18","ROt18","LM98") 
+
+# Get the values of the Sample and HTO_MaxID columns from the Seurat object
+samples <- (BAL_int$Sample)
+htoMaxIDs <- (BAL_int$HTO_maxID)
+
+# Create an empty vector to store the AnimalID values
+animalIDValues <- character(length = 95288)
+
+# Loop through each cell and assign the AnimalID based on Sample and HTO_MaxID values
+for (i in 1:107830) {
+  sampleValue <- samples[[i]]
+  htoMaxIDValue <- htoMaxIDs[[i]]
+  
+  
+  if (sampleValue == "BAL_2dpi_Hashes123_s001" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[1]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s001" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[2]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s001" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[3]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s002" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[4]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s002" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[5]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s002" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[6]
+    
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s003" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[1]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s003" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[2]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s003" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[3]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s007" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[4]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s007" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[5]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s007" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[6]
+    
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s010" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[10]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s010" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[11]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s010" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[12]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s011" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[7]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s011" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[8]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s011" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[9]
+    
+    
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s013" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[7]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s013" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[8]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s013" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[9]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s017" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[10]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s017" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[11]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s017" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[12]
+    
+    
+  } else if (sampleValue == "BAL_2dpi_Hashes12_s020" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[13]
+  } else if (sampleValue == "BAL_2dpi_Hashes12_s020" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[14]
+  } else if (sampleValue == "BAL_2dpi_Hashes56_s021" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[17]
+  } else if (sampleValue == "BAL_2dpi_Hashes56_s021" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[18]
+    
+    
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s023" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[13]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s023" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[14]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s023" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[15]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s026" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[16]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s026" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[17]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s026" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[18]
+    
+    
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s027" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[19]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s027" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[20]
+  } else if (sampleValue == "BAL_2dpi_Hashes123_s027" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[21]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s028" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[22]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s028" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[23]
+  } else if (sampleValue == "BAL_2dpi_Hashes456_s028" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[24]
+    
+    
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s029" && htoMaxIDValue == "Hash1Human-C0251-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[19]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s029" && htoMaxIDValue == "Hash2Human-C0252-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[20]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes123_s029" && htoMaxIDValue == "Hash3Human-C0253-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[21]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s030" && htoMaxIDValue == "Hash4Human-C0254-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[22]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s030" && htoMaxIDValue == "Hash5Human-C0255-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[23]
+  } else if (sampleValue == "BAL_NX (7 or 8 dpi)_Hashes456_s030" && htoMaxIDValue == "Hash6Human-C0256-TotalSeqC") {
+    animalIDValues[i] <- animalIDs[24]
+  }  
+  else {
+    animalIDValues[i] <- "NA"
+  }
+}
+BAL_int$AnimalID <- "NA"
+
+BAL_int$AnimalID <- animalIDValues
+
+
+BAL_int$AnimalID <- factor(BAL_int$AnimalID)
+summary(BAL_int$AnimalID)
+
+#creating Dose column 
+dose<- character(length = 95288)
+
+for (i in 1:95288) {
+  nAnimalID <- animalIDValues[i]
+  if (is.na(nAnimalID)) {
+    dose[i] <- NA  
+  } else if (grepl("LM65|RVo18|RWo17|RJr18|RHv18|RAu18", nAnimalID)) {
+    dose[i] <- "PGT121"
+  } else if (grepl("RPb19|RNw18|RZn18|RJn18|RIn18|LM98", nAnimalID)) {
+    dose[i] <- "40.8_10mg"
+  } else if (grepl("RIL18|MB11|RBt18|RYu18|LL60|RGu18", nAnimalID)) {
+    dose[i] <- "40.8_1mg"
+  } else if (grepl("RWj18|RFu18|ROk18|RIr18|RUv18|ROt18", nAnimalID)) {
+    dose[i] <- "40.8_0.1mg"
+  }
+}
+
+
+
+```
+
+```{r Calculating macrophage populations}
+# Set up factors
+BAL_query$Dose <- "NA"
+BAL_query$Dose <- dose
+BAL_query$Dose <- factor(BAL_query$Dose)
+
+
+BAL_query$predicted.celltype <- factor(BAL_query$predicted.celltype, levels = c("CD163+MRC1+ Mac","CD163+MRC1+TREM2+ Mac","CD163+MRC1- Mac","CD16+ Mono"))
+
+
+BAL_query$Time_Group <- paste0(BAL_query$Timepoint," ",BAL_query$Group)
+BAL_query$celltype_Group_Time <- paste0(BAL_query$predicted.celltype,"_",BAL_query$Group,"_",BAL_query$Timepoint)
+BAL_query$celltype_Time <- paste0(BAL_query$predicted.celltype," ",BAL_query$Timepoint)
+
+BAL_query$celltype_Time <- factor(BAL_query$celltype_Time, levels = c("CD163+MRC1- Mac 2dpi","CD163+MRC1- Mac NX (7 or 8 dpi)",
+                                                                                  "CD163+MRC1+TREM2+ Mac 2dpi","CD163+MRC1+TREM2+ Mac NX (7 or 8 dpi)",
+                                                                                  "CD163+MRC1+ Mac 2dpi","CD163+MRC1+ Mac NX (7 or 8 dpi)",
+                                                                                  "CD16+ Mono 2dpi","CD16+ Mono NX (7 or 8 dpi)"))
+BAL_query_factor<-BAL_query
+saveRDS(BAL_query_factor,"BAL_query_factor.rds")
+
+#Add day column
+
+day <- character(length = 95288)
+ for (i in 1:95288) {
+  sampleValue <- samples[[i]]
+  if (is.na(sampleValue)) {
+    day[i] <- NA  
+  } else if (grepl("2dpi", sampleValue)) {
+    day[i] <- "2"}
+  else if (grepl("(7 or 8 dpi)", sampleValue)) {
+    day[i] <- "NX"}
+}
+
+BAL_query_factor$Day <- day
+
+
+
+#Add Dose Day Column
+
+BAL_query_factor2$Treatment_Day <- paste0(BAL_query_factor2$Dose," ",BAL_query_factor2$Day)
+head(BAL_query_factor2$Treatment_Day) 
+saveRDS(BAL_query_factor2,"BAL_query_factor2.rds")
+
+
+#Graphing
+d1 <- as.data.frame(as.matrix(prop.table(table(BAL_query_factor$Dose,BAL_query_factor$celltype_Time),1) * 100))
+head(d1)
+names(d1) <- c("Treatment","Cell","Percentage")
+
+
+d1$Cell <- factor(d1$Cell, levels = c("CD163+MRC1- Mac 2dpi","CD163+MRC1- Mac NX (7 or 8 dpi)",
+                                      "CD163+MRC1+TREM2+ Mac 2dpi","CD163+MRC1+TREM2+ Mac NX (7 or 8 dpi)",
+                                      "CD163+MRC1+ Mac 2dpi","CD163+MRC1+ Mac NX (7 or 8 dpi)",
+                                      "CD16+ Mono 2dpi","CD16+ Mono NX (7 or 8 dpi)"))
+
+d1
+#Create subsets based on Day and adjust the proportions 
+selected_rows <- c(1:4, 9:12,17:20,25:28)
+selected_rows2 <- c(5:8, 13:16,21:24,29:32)
+d2 <- d1[selected_rows,]
+d3 <- d1[selected_rows2,]
+d2
+
+d2 <- d2[ , , drop = FALSE]  # Convert subset_df to a data frame (if it's not already)
+rownames(d2) <- NULL
+adjusted_d2 <- d2
+adjusted_d2
+
+
+# Create a new data frame with the adjusted percentages
+adjusted_d2 <- d2
+
+
+# Calculate the new percentages based on the totals of each group
+for (i in 1:4) {
+  # Calculate the total for the current group
+  total <- sum(adjusted_d2$Percentage[(i + c(0, 4, 8, 12))])
+  
+  # Calculate the new percentages for the current group
+  adjusted_d2$Percentage[(i + c(0, 4, 8, 12))] <- adjusted_d2$Percentage[(i + c(0, 4, 8, 12))] / total * 100
+}
+
+# Round the adjusted percentages to a desired number of decimal places
+adjusted_d2$Percentage <- round(adjusted_d2$Percentage, 2)
+
+adjusted_d2
+
+#same calculations as above for d3 
+d3 <- d3[ , , drop = FALSE]  
+rownames(d3) <- NULL
+adjusted_d3 <- d3
+adjusted_d3
+
+adjusted_d3 <- d3
+
+for (i in 1:4) {
+
+  total <- sum(adjusted_d3$Percentage[(i + c(0, 4, 8, 12))])
+  
+
+  adjusted_d3$Percentage[(i + c(0, 4, 8, 12))] <- adjusted_d3$Percentage[(i + c(0, 4, 8, 12))] / total * 100
+}
+
+adjusted_d3$Percentage <- round(adjusted_d3$Percentage, 2)
+
+adjusted_d3
+
+category_order <- c("40.8_0.1mg", "40.8_1mg", "40.8_10mg", "PGT121")
+adjusted_d2$Treatment <- factor(adjusted_d2$Treatment, levels = category_order)
+adjusted_d3$Treatment <- factor(adjusted_d3$Treatment, levels = category_order)
+#day 2 proportion of macrophage populations 
+p1<-ggplot(adjusted_d2, aes(fill=Cell, y=Percentage, x=Treatment)) + 
+  geom_bar(position="stack", stat="identity") +
+  theme_bw() + ylab("Percentage of Macrophages/Monocytes") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  theme(text = element_text(size=14),
+        axis.text.x = element_text(size=12, color = "black", angle = 45,vjust = 0.5),
+        axis.text.y = element_text(size=12, color = "black")) +
+  theme(strip.background =element_rect(fill="white")) +
+  scale_fill_manual(values= c("#fb6a4a","#a50f15","#045a8d","#fec44f")) + 
+  theme(legend.position = "none")
+p1
+
+#day 7/8 proportion of macrophage populations 
+p2<-ggplot(adjusted_d3, aes(fill=Cell, y=Percentage, x=Treatment)) + 
+  geom_bar(position="stack", stat="identity") +
+  theme_bw() + ylab("Percentage of Macrophages/Monocytes") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  theme(text = element_text(size=14),
+        axis.text.x = element_text(size=12, color = "black", angle = 45,vjust = 0.5),
+        axis.text.y = element_text(size=12, color = "black")) +
+  theme(strip.background =element_rect(fill="white")) +
+  scale_fill_manual(values= c("#fb6a4a","#a50f15","#045a8d","#fec44f")) + 
+  theme(legend.position = "none")
+
+p2
+
+
+#Create subsets based on the Day of collection: 
+
+
+BAL_query_factor_2dpi <- BAL_query_factor[grep("2dpi", BAL_query_factor@meta.data$Sample), ]
+BAL_query_factor_NX <- BAL_query_factor[grep("NX", BAL_query_factor@meta.data$Sample), ]
+
+#Integrated Dot PLot
+DotPlot(BAL_query_factor,features = c("CD163","MRC1","MARCO","TREM2","APOBEC3A","S100A8","FCGR3","CD14","FCER1A","CD1C")) + coord_flip()
+
+
+# Get the cluster assignments for each cell
+cluster_assignments <- BAL_query_factor@meta.data$seurat_clusters
+
+# Count the number of cells in each cluster
+cell_counts <- table(cluster_assignments)
+
+# Print the cell counts
+print(cell_counts)
+
+```
+
+```{r Viral reads d2 }
+
+BAL_int_day$Cell_Day<- paste0(BAL_int_day$BP.main,"_",BAL_int_day$Day)
+BAL_int_day$Cell_Day <- factor(BAL_int_day$Cell_Day, levels = sort(unique(BAL_int_day$Cell_Day)))
+Idents(BAL_int_day) <- "Cell_Day"
+
+BAL_int_d2 <- subset(BAL_int_day,cells= row.names(BAL_int_day@meta.data[BAL_int_day$Day == "2",]))
+BAL_int_d2$Day <- droplevels(BAL_int_d2$Cell_Day)
+unique(BAL_int_d2$Cell_Day)
+
+
+viralreads_d2 <-table(BAL_int_day$BP.main,BAL_int_day$Day,BAL_int_day$percent.cov2)
+viralreads_d2
+Idents(BAL_int_d2) <- "Cell_Day"
+
+pv2 <- VlnPlot(BAL_int_d2,"percent.cov2",pt.size = 0.4)  +
+  scale_x_discrete() +
+  coord_cartesian(ylim = c(0, 5)) + 
+  ylab("Percentage of viral reads\nin each cell") + ggtitle("All Cell Types 2 dpi") +
+  theme(axis.text.y = element_text(size=11, color = "black")) +
+  theme(plot.margin = unit(c(1,1,1,1), "cm")) & NoLegend()
+summary( pv2$data)
+print(p1)
+
+ggsave(plot = p1, filename = "Vln_viralreads_mac_D2_v3.pdf",
+       height = 3, width = 2, units = "in")
+```
+
+```{r Dotplots}
+isg <- c("CXCL10","GBP1","GBP2","IFI27","IFI44L","IFI6","IFIT2","IFIT3","IFIT5","IRF7","ISG15","ISG20","MX1","MX2","OAS1","OAS2","OAS3","RSAD2","STAT1")
+
+cytokines <- c("IFNB1","IFNG","IL10","IL15","IL1B","IL6","IL7","TNF")
+
+chemokines <- c("CCL2","CCL20","CCL22","CCL3","CCL4L1","CCL5","CCL7","CCL8","CXCL10","CXCL11","CXCL3","CXCL8","CXCL9")
+
+inflammasome <- c("IL27","IL1RN","IL1B","IL18","NLRP3","GSDMD","CASP1","AIM2")
+
+receptors <- c("ACE2","TMPRSS2","CD209","CLEC4M","SIGLEC1","NRP1","CLEC4G","ASGR1","CD207","CLEC10A","TTYH2","FCGR3","FCGR2A","FCGR1A")
+
+MSD <- c("CSF3", "CSF2", "IFNG", "IL10", "IL12A", "IL12B", "IL1B", "IL1RN", "IL4", "IL5", "IL6", "IL7", "CXCL8", "IL9", "CXCL10", "CCL3", "TNF", "VEGFA" )
+
+
+BAL_query_factor2_sub <- subset(BAL_query_factor2, cells= row.names(BAL_query_factor2@meta.data[BAL_query_factor2$predicted.celltype != "CD16+ Mono",]))
+DefaultAssay(BAL_query_factor2_sub) <-"RNA"
+BAL_query_factor2_sub <- NormalizeData(BAL_query_factor2_sub, verbose = F)
+BAL_query_factor2_sub <- FindVariableFeatures(BAL_query_factor2_sub, selection.method = "vst", verbose = F)
+BAL_query_factor2_sub <- ScaleData(BAL_query_factor2_sub, verbose = F)
+
+BAL_query_factor2_sub$Type_Day_Group <- "NA"
+BAL_query_factor2_sub$Type_Day_Group <- paste0(BAL_query_factor2_sub$predicted.celltype," ",BAL_query_factor2_sub$Treatment_Day)
+head(BAL_query_factor2_sub$Type_Day_Group)
+
+sort(unique(BAL_query_factor2_sub$Type_Day_Group))
+BAL_query_factor2_sub$Type_Day_Group <- factor(BAL_query_factor2_sub$Type_Day_Group, 
+                                         levels =c( "CD163+MRC1- Mac PGT121 2",
+                                                    "CD163+MRC1- Mac PGT121 NX", 
+                                                     "CD163+MRC1- Mac 40.8_0.1mg 2",
+                                                    "CD163+MRC1- Mac 40.8_0.1mg NX",
+                                                    "CD163+MRC1- Mac 40.8_1mg 2",
+                                                    "CD163+MRC1- Mac 40.8_1mg NX",
+                                                    "CD163+MRC1- Mac 40.8_10mg 2",        
+                                                    "CD163+MRC1- Mac 40.8_10mg NX",
+                                                    
+       
+                                                    "CD163+MRC1+ Mac PGT121 2",           
+                                                    "CD163+MRC1+ Mac PGT121 NX",
+                                                    "CD163+MRC1+ Mac 40.8_0.1mg 2",       
+                                                    "CD163+MRC1+ Mac 40.8_0.1mg NX",
+                                                    "CD163+MRC1+ Mac 40.8_1mg 2",
+                                                    "CD163+MRC1+ Mac 40.8_1mg NX",
+                                                    "CD163+MRC1+ Mac 40.8_10mg 2",
+                                                    "CD163+MRC1+ Mac 40.8_10mg NX",
+                                                     
+                                                    "CD163+MRC1+TREM2+ Mac PGT121 2",
+                                                    "CD163+MRC1+TREM2+ Mac PGT121 NX",
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_0.1mg 2",
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_0.1mg NX",
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_1mg 2",   
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_1mg NX",
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_10mg 2",
+                                                    "CD163+MRC1+TREM2+ Mac 40.8_10mg NX"
+                                                             ))
+
+Idents(BAL_query_factor2_sub) <- "Type_Day_Group"
+head(BAL_query_factor2_sub$Type_Day_Group)
+saveRDS(BAL_query_factor2_sub, "BAL_query_factor2_sub")
+
+
+
+p1 <- DotPlot(BAL_query_factor2_sub, dot.scale = 5, col.min = -2.5, col.max = 2.5, features = isg, assay = "RNA") + 
+  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  xlab("ISGs") +
+  scale_y_discrete(labels = rep("",24)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  theme(axis.text.x = element_text(size=10, color = "black",angle = 50,hjust = 1)) +
+  theme(axis.text.y = element_text(size=10, color = "black")) +
+  theme(axis.ticks.x = element_blank()) +
+  geom_hline(yintercept = seq(2.5,24,by=2), linetype="dashed") +
+  geom_hline(yintercept = seq(8.5,25,by=8)) +
+  geom_vline(xintercept = c(17.6,18.5)) +
+  annotate("text", x = 19, y = seq(1.5,24, by = 2), 
+           label = rep(c("PGT121","0.1mg","1mg","10mg"),3), size=3)+
+  
+  annotate("text", x = 20, y = seq(4.5,24, by = 8), 
+           label = c("CD163+MRC1-","CD163+MRC1+","CD163+MRC1+TREM2+"), fontface = "bold") +
+  annotate("text", x = 18, y = seq(1.5,24, by = 2), 
+         label = rep(c("D2  NX"),12), size=3) +
+  labs(y = NULL)
+
+p1
+datap1 <- p1$data
+p2 <- DotPlot(BAL_query_factor2_sub,dot.scale = 5, col.min = -2.5, col.max = 2.5, features = cytokines, assay = "RNA") + 
+  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  xlab("Inflammatory") +
+  scale_y_discrete(labels = rep(c(""),24)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  theme(axis.text.x = element_text(size=11, color = "black",angle = 50,hjust = 1)) +
+  theme(axis.text.y = element_text(size=11, color = "black")) +
+  geom_hline(yintercept = seq(2.5,24,by=2), linetype="dashed") +
+  theme(axis.ticks.x = element_blank()) +
+  geom_hline(yintercept = seq(8.5,25,by=8)) +
+  geom_vline(xintercept = c(8.5)) +
+  geom_vline(xintercept = c(10.5))+
+  annotate("text", x = 10, y = seq(1.5,24, by = 2), 
+           label = rep(c("PGT121","0.1mg","1mg","10mg"),3), size=3)+
+  annotate("text", x = 9, y = seq(1.5,24, by = 2), 
+           label = rep(c("D2  NX"),12), size=3) +
+  annotate("text", x = 11, y = seq(4.5,24, by = 8), 
+           label = c("CD163+MRC1-","CD163+MRC1+","CD163+MRC1+TREM2+"), fontface = "bold") +
+  labs(y = NULL)
+p2
+datap2 <- p2$data
+p3 <- DotPlot(BAL_query_factor2_sub,dot.scale = 5, col.min = -2.5, col.max = 2.5, features = chemokines, assay = "RNA") + 
+  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  scale_y_discrete(labels = rep(c(""),24)) +
+  xlab("Chemokines") +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  theme(axis.text.x = element_text(size=11, color = "black")) +
+  theme(axis.text.y = element_text(size=11, color = "black")) +
+  geom_hline(yintercept = seq(2.5,24,by=2), linetype="dashed") +
+  theme(axis.ticks.x = element_blank()) +
+  geom_hline(yintercept = seq(8.5,25,by=8)) +
+  geom_vline(xintercept = c(13.5)) +
+  annotate("text", x = 15, y = seq(1.5,24, by = 2), 
+           label = rep(c("PGT121","0.1mg","1mg","10mg"),3), size=3)+
+  annotate("text", x = 14, y = seq(1.5,24, by = 2), 
+           label = rep(c("D2  NX"),12), size=3) +
+  annotate("text", x = 16, y = seq(4.5,24, by = 8), 
+           label = c("CD163+MRC1-","CD163+MRC1+","CD163+MRC1+TREM2+"), fontface = "bold") +
+  labs(y = NULL)
+
+p3
+datap3 <- p3$data
+
+p4 <- DotPlot(BAL_query_factor2_sub,dot.scale = 5, col.min = -2.5, col.max = 2.5, features = inflammasome, assay = "RNA") + coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  scale_y_discrete(labels = rep(c(""),24)) +
+  xlab("Inflammasome") +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  theme(axis.text.x = element_text(size=14, color = rep(c("#ff8c69","#00578b"),13))) +
+  theme(axis.text.y = element_text(size=11, color = "black")) +
+  geom_hline(yintercept = seq(2.5,24,by=2), linetype="dashed") +
+  theme(axis.ticks.x = element_blank()) +
+  geom_hline(yintercept = seq(8.5,25,by=8)) +
+  geom_vline(xintercept = c(8.5)) +
+  labs(y = NULL)
+  theme(plot.margin = unit(c(1,1,1,1), "cm")) +
+  annotate("text", x = 10, y = seq(1.5,24, by = 2), 
+           label = rep(c("PGT121","0.1mg","1mg","10mg"),3), size=3)+
+  annotate("text", x = 9, y = seq(1.5,24, by = 2), 
+           label = rep(c("D2  NX"),12), size=3) +
+  annotate("text", x = 11, y = seq(4.5,24, by = 8), 
+           label = c("CD163+MRC1-","CD163+MRC1+","CD163+MRC1+TREM2+"), fontface = "bold") 
+
+p4
+datap4 <- p4$data
+
+p5 <- DotPlot(BAL_query_factor2_sub, dot.scale = 5, col.min = -2.5, col.max = 2.5, features = MSD, assay = "RNA") + 
+  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  xlab("MSD") +
+  scale_y_discrete(labels = rep("",24)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  theme(axis.text.x = element_text(size=10, color = "black",angle = 50,hjust = 1)) +
+  theme(axis.text.y = element_text(size=10, color = "black")) +
+  theme(axis.ticks.x = element_blank()) +
+  geom_hline(yintercept = seq(2.5,24,by=2), linetype="dashed") +
+  geom_hline(yintercept = seq(8.5,25,by=8)) +
+  geom_vline(xintercept = c(18.5,19.5)) +
+  annotate("text", x = 20, y = seq(1.5,24, by = 2), 
+           label = rep(c("PGT121","0.1mg","1mg","10mg"),3), size=3)+
+  
+  annotate("text", x = 21, y = seq(4.5,24, by = 8), 
+           label = c("CD163+MRC1-","CD163+MRC1+","CD163+MRC1+TREM2+"), fontface = "bold") +
+  annotate("text", x = 19, y = seq(1.5,24, by = 2), 
+           label = rep(c("D2  NX"),12), size=3) 
+
+p5
+
+
+l1 <- length(isg)  
+l2 <- length(cytokines) 
+l3 <- length(chemokines)
+l4 <- length(inflammasome)
+
+tot <- l1 + l2 + l3 + l4
+
+p <- p1 / p2 / p3 / p4  + plot_layout(heights = c(l1/tot,l2/tot,l3/tot,l4/tot))  & NoLegend()
+p
+ggsave(plot = p, filename = "Macrophages_Dotplot_Main.pdf", height = 12, width = 8, units = "in")
+
+```
+

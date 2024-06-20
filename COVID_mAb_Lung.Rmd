@@ -1,0 +1,1111 @@
+---
+title: "COVID19_mAb_LUNG"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
+library(Seurat)
+library(SingleR)
+library(stringr)
+library(ggplot2)
+library(SingleCellExperiment)
+library(dplyr)
+library(celldex)
+library(hdf5r)
+library(Matrix)
+library(RColorBrewer)
+library(openxlsx)
+install.packages("openxlsx")
+list.of.packages <- c("devtools","rmarkdown","dplyr","tidyr","ggplot2","ggrastr","BiocManager","openxlsx","tidyverse","rstatix","hdf5r","ggprism")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+
+
+ref <- BlueprintEncodeData()
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
+y_genes <- as.character(unlist(read.table("Y_genes.txt"),use.names = F))
+mt_genes <-  as.character(unlist(read.table("MT_genes.txt"),use.names = F))
+ig_genes <- as.character(unlist(read.table("IG_genes.txt"),use.names = F))
+tr_genes <- as.character(unlist(read.table("TR_genes.txt"),use.names = F))
+prot_coding <- as.character(unlist(read.table("protein_coding_seurat.txt"),use.names = F))
+
+data_path <- "/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/Lung"  
+
+dirs <- list.dirs(data_path, recursive = FALSE)
+dirs <- dirs[grepl("Mmul10_MT246667", dirs)]
+dirs
+
+setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/Lung")
+list_obj_lung <- list()
+```
+
+## R Markdown
+
+
+
+```{r run QC, echo=FALSE}
+
+runQC <- function(path){
+  
+  animalid <- str_extract(path,"RVo18|RWo17|LM65|RWj18|RPb19|RNw18|RIn18|RUv18|RFu18")
+  timepoint <- "NX"
+  group <- ifelse(grepl("RVo18|RWo17|LM65", path) ,"PGT121",
+                  ifelse(grepl("RPb19|RNw18|RIn18", path) ,"40.8_10mg",
+                                ifelse("40.8_.1mg")))
+  tissue <- "Lung"
+  
+  s <- paste(tissue,timepoint,group,animalid, sep="_")
+  
+  counts <- Read10X_h5(paste0(path, "/outs/per_sample_outs/count/sample_filtered_feature_bc_matrix.h5"))
+  
+  obj <- CreateSeuratObject(counts=counts$`Gene Expression`,project=s)
+  
+  rps_genes <- row.names(obj)[grepl("^RP[S,L]",row.names(obj))]
+  cov2_genes <- row.names(obj)[grepl("SARS-CoV2",row.names(obj))]
+  obj[["percent.cov2"]] <- PercentageFeatureSet(obj, features = cov2_genes)
+  obj[["percent.hbb"]] <- PercentageFeatureSet(obj, pattern = "^HBB")
+  obj[["percent.mito"]] <- PercentageFeatureSet(obj, features = mt_genes)
+  obj[["percent.ig"]] <- PercentageFeatureSet(obj, features = ig_genes)
+  obj[["percent.rps.rpl"]] <- PercentageFeatureSet(obj, features = rps_genes)
+  obj$log10GenesPerUMI <- log10(obj$nFeature_RNA) / log10(obj$nCount_RNA)
+  
+  meta <- obj@meta.data[,c("percent.hbb","percent.mito","percent.rps.rpl","percent.ig","percent.cov2","log10GenesPerUMI")]
+  
+  obj$Sample <- s
+  obj$Group <- group
+  obj$Tissue <- tissue
+  obj$Timepoint <- timepoint
+  
+  p <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA","percent.mito","percent.rps.rpl"))
+  out <- paste0(s,"_QC.png")
+  ggsave(p,file=out)
+  
+  list_obj_lung[[s]] <<- obj
+}
+
+# Run QC and create seurat objects
+lapply(dirs,runQC)
+
+
+
+
+
+```
+
+```{r create obj, message=TRUE, warning=TRUE}
+createobj <- function(obj){
+  obj <- subset(obj, subset= (nFeature_RNA >= 200) & (nFeature_RNA <=4000) &
+                  (log10GenesPerUMI >= 0.8) &
+                  (percent.mito < 20) & 
+                  (percent.rps.rpl < 50))
+  s <- unique(obj$Sample)
+  
+  p <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA","percent.mito","percent.hbb","percent.rps.rpl","percent.ig"))
+  out <- paste0(s,"_QC_filter.png")
+  ggsave(p,file=out)
+  
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj, selection.method = "vst")
+  obj <- ScaleData(obj)
+  
+  DefaultAssay(obj) <- "RNA"
+  normdata <- GetAssayData(obj, assay="RNA", slot = "data")
+  common <- intersect(row.names(normdata),row.names(ref))
+  normdata <- normdata[common,]
+  ref <- ref[common,]
+  
+  bp.main <- SingleR(test = normdata, ref = ref,
+                     labels = ref$label.main, assay.type.ref = "logcounts")
+  
+  obj[["BP.main"]] <- bp.main$labels
+  obj[["BP.main.pruned"]] <- bp.main$pruned.labels
+  
+  bp.fine <- SingleR(test = normdata, ref = ref,
+                     labels = ref$label.fine, assay.type.ref = "logcounts")
+  obj[["BP.fine"]] <- bp.fine$labels
+  obj[["BP.fine.pruned"]] <- bp.fine$pruned.labels
+  
+  obj <- CellCycleScoring(obj, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+  
+  obj <- SCTransform(obj, verbose = FALSE)
+  obj <- RunPCA(obj, verbose = FALSE)
+  obj <- RunUMAP(obj, dims = 1:30, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = 1:30, verbose = FALSE)
+  obj <- FindClusters(obj, verbose = FALSE)
+  
+  p <- DimPlot(obj, label=TRUE) + NoLegend()
+  out <- paste0(s,"_UMAP.png")
+  ggsave(p,file=out)
+  
+  Idents(obj) <- "SingleR"
+  p <- DimPlot(obj, label=TRUE)
+  out <- paste0(s,"_SingleR_UMAP.png")
+  ggsave(p,file=out)
+  
+  return(obj)  
+}
+
+list_obj2_lung <- lapply(list_obj_lung,createobj)
+
+saveRDS(list_obj2_lung,"lung_list_objects_all.rds")
+```
+
+```{r Integrate}
+
+int_lungs.features <- SelectIntegrationFeatures(object.list = list_obj2_lung, normalization.method = "SCT",nfeatures = 3000) 
+int_lungs.list <- PrepSCTIntegration(list_obj2_lung, anchor.features = int_lungs.features, verbose = FALSE)
+anchors <- FindIntegrationAnchors(int_lungs.list, normalization.method = "SCT",anchor.features = int_lungs.features, verbose = FALSE)
+int_lungs <- IntegrateData(anchorset = anchors, normalization.method = "SCT", verbose = TRUE)
+int_lungs <- RunPCA(int_lungs, verbose = FALSE)
+int_lungs <- RunUMAP(int_lungs, dims = 1:30)
+int_lungs <- FindNeighbors(int_lungs, dims = 1:30, verbose = FALSE)
+int_lungs <- FindClusters(int_lungs, verbose = FALSE)
+Idents(int_lungs) <- "BP.main"
+DimPlot(int_lungs, group.by = "BP.main", label = TRUE)
+#different resolutions
+int_lungs <- FindClusters(int_lungs, verbose = FALSE, resolution = c(0.1,0.25,0.5,0.75,1))
+
+colnames(int_lungs@meta.data)
+
+p0 <- DimPlot(int_lungs, group.by = "BP.main", label = T) & NoAxes()
+p1 <- DimPlot(int_lungs, group.by = "integrated_snn_res.0.25", label = T) & NoAxes()
+
+p0 + p1
+
+DefaultAssay(int_lungs) <-"RNA"
+int_lungs <- NormalizeData(int_lungs, verbose = F)
+int_lungs <- FindVariableFeatures(int_lungs, selection.method = "vst", verbose = F)
+int_lungs <- ScaleData(int_lungs, verbose = F)
+
+saveRDS(int_lungs,"int_lungs_v1.rds")
+
+````
+
+
+```{r Preliminary Annotation}
+DotPlot(int_lungs,features = c("CPE","HOPX", "SFTPA1","FBLN1", "CD3D", "CD3E", "CD19", "AGER", "S100A8", "ITLN1", "CCDC50", "KIT", "CD163", "PECAM1", "FCGR3", "TAGLN", "ACTA2", "COX4I2", "DCN", "LUM", "CD68", "APOE", "NKG7", "CCR7", "LAMP3", "MARCKSL1", "FCER1A", "CST6", "TPPP3", "FLT3", "CD1C", "CLEC9A", "SELL", "IRF8", "MS4A1", "CD79A", "GZMB", "MAMU-DRA", "MAMU-DRB1", "IL1RN", "IFIT3", "SOD2", "CSF3R", "MARCO", "CHIT1", "MRC1", "TREM2", "APOBEC3A", "CD14")) + RotatedAxis() +
+  theme(axis.text.x = element_text(color = "black",size = 11, angle = 45, hjust = 1))
+
+
+
+int_lungs$Manual <- "NA"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "0"] <- "Endothelial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "1"] <- "T/NK cells"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "2"] <- "Endothelial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "3"] <- "Endothelial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "4"] <- "Smooth muscle cells/Fibroblasts"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "5"] <- "Smooth muscle cells"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "6"] <- "Fibroblasts"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "7"] <- "Fibroblasts"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "8"] <- "NK cells"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "9"] <- "AT1"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "10"] <- "Ciliated"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "11"] <- "B cells"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "12"] <- "Monocytes"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "13"] <- "Neutrophils"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "14"] <- "Macrophages"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "15"] <- "Endothelial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "16"] <- "Unassigned"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "17"] <- "Endotheial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "18"] <- "pDC"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "19"] <- "Mesothelial"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "20"] <- "T/NK cells"
+int_lungs$Manual[int_lungs$integrated_snn_res.0.25 == "21"] <- "Mast"
+
+int_lungs$Type1 <- "NA"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "0"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "1"] <- "Lymphoid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "2"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "3"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "4"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "5"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "6"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "7"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "8"] <- "Lymphoid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "9"] <- "Epithelial"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "10"] <- "Epithelial"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "11"] <- "Lymphoid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "12"] <- "Myeloid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "13"] <- "Myeloid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "14"] <- "Myeloid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "15"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "16"] <- "Unassigned"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "17"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "18"] <- "Myeloid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "19"] <- "Other"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "20"] <- "Lymphoid"
+int_lungs$Type1[int_lungs$integrated_snn_res.0.25 == "21"] <- "Myeloid"
+
+DimPlot(int_lungs, group.by = "Type1",cols = c("#4daf4a","#377eb8","#e41a1c","#ff7f00", "#000000"),raster = T) & NoAxes()
+
+saveRDS(int_lungs,"int_lungs_classify_v1.rds")
+
+
+```
+
+
+
+```{r split and integrate}
+split_obj_sct <- function(obj, var_split){
+  
+  DefaultAssay(obj) <- "RNA"
+  
+  list_obj <- SplitObject(obj, split.by = var_split)
+  
+  for (i in names(list_obj)) {
+    print(i)
+    list_obj[[i]]  <- DietSeurat(list_obj[[i]], counts = TRUE, data = TRUE, scale.data = FALSE, assays = "RNA")
+    list_obj[[i]] <- SCTransform(list_obj[[i]], verbose = FALSE)
+  }
+  
+  return(list_obj)
+}
+
+integrate <- function(list_obj, ndim = 30) {
+  
+  options(future.globals.maxSize= 33554432000)
+  
+  int.features <- SelectIntegrationFeatures(object.list = list_obj, normalization.method = "SCT",nfeatures = 3000) 
+  int.list <- PrepSCTIntegration(list_obj, anchor.features = int.features, verbose = FALSE)
+  
+  int.list <- lapply(X = int.list, FUN = RunPCA, features = int.features)
+  anchors <- FindIntegrationAnchors(int.list, normalization.method = "SCT",anchor.features = int.features,
+                                    reduction = "rpca", verbose = F, dims = 1:ndim)
+  
+  int <- IntegrateData(anchorset = anchors, normalization.method = "SCT", verbose = FALSE)  
+  DefaultAssay(int) <- "integrated"
+  
+  int <- RunPCA(int, verbose = FALSE)
+  int <- RunUMAP(int, dims = 1:ndim, verbose = FALSE)
+  int <- FindNeighbors(int, dims = 1:ndim, verbose = FALSE)
+  int <- FindClusters(int, verbose = FALSE, resolution = c(0.1,0.25,0.5,0.75,1))
+  
+  DefaultAssay(int) <-"RNA"
+  int <- NormalizeData(int, verbose = F)
+  int <- FindVariableFeatures(int, selection.method = "vst", verbose = F)
+  int <- ScaleData(int, verbose = F)
+  
+  return(int)
+
+# cluster_separtely
+DimPlot(int_lungs, group.by = "Type1")
+
+epithelial <- subset(int_lungs, cells = row.names(int_lungs@meta.data[int_lungs$Type1 == "Epithelial",]))
+epithelial_list_obj <- split_obj_sct(epithelial,"Sample")
+epithelial_int <- integrate(epithelial_list_obj)
+DimPlot(epithelial_int, label = T, group.by = "integrated_snn_res.0.25")
+saveRDS(epithelial_int, "epithelial_int.rds")
+
+lymphoid <- subset(int_lungs, cells = row.names(int_lungs@meta.data[int_lungs$Type1 == "Lymphoid",]))
+lymphoid_list_obj <- split_obj_sct(lymphoid,"Sample")
+lymphoid_int <- integrate(lymphoid_list_obj)
+DimPlot(lymphoid_int, label = T, group.by = "integrated_snn_res.0.1")
+saveRDS(lymphoid_int, "lymphoid_int.rds")
+
+myeloid <- subset(int_lungs, cells = row.names(int_lungs@meta.data[int_lungs$Type1 == "Myeloid",]))
+myeloid_list_obj <- split_obj_sct(myeloid,"Sample")
+myeloid_int <- integrate(myeloid_list_obj)
+DimPlot(myeloid_int, label = T, group.by = "integrated_snn_res.0.1")
+saveRDS(myeloid_int, "myeloid_int.rds")
+
+other <- subset(int_lungs, cells = row.names(int_lungs@meta.data[int_lungs$Type1 == "Other",]))
+other_list_obj <- split_obj_sct(other,"Sample")
+other_int <- integrate(other_list_obj)
+DimPlot(other_int, label = T, group.by = "integrated_snn_res.0.1")
+saveRDS(other_int, "other_int.rds")
+  
+  
+}
+```
+
+
+```{r epithelial}
+
+DefaultAssay(epithelial_int) <- "RNA"
+Idents(epithelial_int) <- "integrated_snn_res.0.1"
+list_genes <- c("AGER","HOPX","SFTPA1","PGC","PECAM1", "PDE4D", "DCN","LRRIQ1","ALDH3A1","TP63","S100A2", "CD3E","CD3D", "CD69")
+pe1 <- DimPlot(epithelial_int, group.by = "integrated_snn_res.0.25",label = T, raster = T, repel = F) + NoAxes() + NoLegend()
+Idents(epithelial_int) <- "integrated_snn_res.0.25"
+pe2 <- DotPlot(epithelial_int,features = list_genes) + coord_flip() 
+
+datape2 <- pe2$data
+filename <- 'datape2.xlsx'
+install.packages("writexl")
+write.xlsx(datape2, filename)
+
+?write.xlsx
+epithelial_int$Manual2 <- "NA"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "0"] <- "AT1"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "1"] <- "AT2"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "2"] <- "AT2" 
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "3"] <- "Unassigned"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "4"] <- "Doublet" # Endothelial
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "5"] <- "Doublet" # Endothelial
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "6"] <- "AT2"  #inflamed / damaged/ recovering 
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "7"] <- "Doublet" # Smooth muscle cells/Fibroblasts
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "8"] <- "Ciliated"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "9"] <- "Basal cells"
+epithelial_int$Manual2[epithelial_int$integrated_snn_res.0.25 == "10"] <- "Doublet" #TNK cells
+
+pe3 <- DimPlot(epithelial_int, group.by = "Manual2",label = T, raster = T, repel = T) + NoAxes() + NoLegend()
+
+(pe1 / pe3 ) | pe2
+
+
+epi_markers <- FindAllMarkers(epithelial_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+saveRDS(epi_markers,"epi_markers.rds")
+
+
+epi_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC) -> top5
+heatmap5 <-DoHeatmap(epithelial_int, features = top5$gene) 
+heatmap5
+
+
+epithelial_int2 <- subset(epithelial_int, cells = row.names(epithelial_int@meta.data[epithelial_int$Manual2 != "Doublet" & epithelial_int$Manual2 != "Unassigned",]))
+DimPlot(epithelial_int2, group.by = "Manual2")
+plot <- DimPlot(epithelial_int2, group.by = "Manual2", label = TRUE)
+
+saveRDS(epithelial_int2,"epithelial_int_Manual2_rmDoubletManual.rds")
+saveRDS(epithelial_int2,"epithelial_int_Manual2_noDoublets.rds")
+```
+
+
+```{r Preliminary Annotation}
+
+int_lungs$Manual = "NA"
+plot <- DimPlot(int_lungs, group.by = "BP.main", label = TRUE)
+select.cells <- CellSelector(plot = plot)
+int_lungs@meta.data[select.cells,]$Manual <- "Myeloid"
+DimPlot(int_lungs, group.by = "BP.main", label = TRUE, split.by = "Manual")
+DimPlot(int_lungs, group.by = "BP.main", split.by = "Manual" ,label = TRUE)
+saveRDS(int_lungs,"Lungs_Myeloid_NA.rds")
+
+# Subset Get macrophages & monocytes
+lungs_macro_mono <- subset(int_lungs, cells = row.names(int_lungs@meta.data[int_lungs$Manual == "Myeloid" & (int_lungs$BP.main == "Monocytes" | int_lungs$BP.main == "Macrophages"),]))
+dim(lungs_macro_mono)
+saveRDS(lungs_macro_mono, "lungs_macro_mono.rds")
+
+
+list_lungs <- SplitObject(lungs_macro_mono, split.by = "Sample")
+for (i in names(list_lungs)) {
+  DefaultAssay(list_lungs[[i]]) <- "RNA"
+  list_lungs[[i]]  <- DietSeurat(list_lungs[[i]], counts = TRUE, data = TRUE, scale.data = FALSE, assays = "RNA")
+  list_lungs[[i]] <- SCTransform(list_lungs[[i]], method = "glmGamPoi", verbose = FALSE)
+}
+lungs_int.features <- SelectIntegrationFeatures(object.list = list_lungs, normalization.method = "SCT",nfeatures = 3000) 
+lungs_int.list <- PrepSCTIntegration(list_lungs, anchor.features = lungs_int.features)
+lungs_int.anchors <- FindIntegrationAnchors(lungs_int.list, normalization.method = "SCT",anchor.features = lungs_int.features)
+lungs_int <- IntegrateData(anchorset = lungs_int.anchors, normalization.method = "SCT")
+DefaultAssay(lungs_int) <- "integrated"
+lungs_int <- RunPCA(lungs_int, verbose = FALSE)
+lungs_int <- RunUMAP(lungs_int, dims = 1:40, verbose = FALSE)
+lungs_int <- FindNeighbors(lungs_int, dims = 1:40, verbose = FALSE)
+lungs_int <- FindClusters(lungs_int, verbose = FALSE, resolution = 0.1)
+DimPlot(lungs_int, label = T)
+
+DefaultAssay(lungs_int) <- "RNA"
+lungs_int <- NormalizeData(lungs_int)
+lungs_int <- FindVariableFeatures(lungs_int, selection.method = "vst")
+lungs_int <- ScaleData(lungs_int)
+
+lung_markers <- FindAllMarkers(lungs_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+
+lung_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(lungs_int, features = top10$gene) + NoLegend()
+
+VlnPlot(lungs_int,c("CD163","MRC1","FABP4","TREM2","S100A8","CD14","FCGR3","FCER1A","CD1C","GZMB","FLT3","CLEC9A"))
+
+write.table(lung_markers,"Lung_macromono_round1_markers.txt", quote=F, sep="\t")
+
+saveRDS(list_lungs,"list_lungs_macromono_round1.rds")
+saveRDS(lungs_int,"Lungs_int_round1.rds")
+````
+
+
+```{r lymphoid}
+
+DefaultAssay(lymphoid_int) <- "RNA"
+Idents(lymphoid_int) <- "integrated_snn_res.0.1"
+
+lymphoid_markers <- FindAllMarkers(lymphoid_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+saveRDS(lymphoid_markers,"lymphoid_markers.rds")
+
+
+lymphoid_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top5
+heatmap5 <-DoHeatmap(lymphoid_int, features = top5$gene) 
+heatmap5
+
+list_genes <- c("CD8A","CD4","CD3D","CD3E","FCER1G","CD19","MS4A1","PECAM1","DCN", "JCHAIN")
+pL1 <- DimPlot(lymphoid_int, group.by = "integrated_snn_res.0.1",label = T, raster = T) + NoAxes() + NoLegend()
+pL2 <- DotPlot(lymphoid_int,features = list_genes) + coord_flip() 
+
+pL1 + pL2
+datapL2 <- pL2$data
+filename <- 'datapL2.xlsx'
+write.xlsx(datapL2, filename)
+
+
+lymphoid_int$Manual2 <- "NA"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "0"] <- "T cells"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "1"] <- "NK cells"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "2"] <- "B cells"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "3"] <- "T cells"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "4"] <- "T cells"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "5"] <- "Doublet" # Endothelial
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "6"] <- "T cells" 
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "7"] <- "Doublet" # Fibroblasts
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "8"] <- "Unassigned"
+lymphoid_int$Manual2[lymphoid_int$integrated_snn_res.0.1 == "9"] <- "Plasma cells" 
+
+
+pL3 <- DimPlot(lymphoid_int, group.by = "Manual2",label = T, raster = T, repel = T ) + NoAxes() + NoLegend()
+
+(pL1 / pL3) | pL2
+
+lymphoid_int2 <- subset(lymphoid_int, cells = row.names(lymphoid_int@meta.data[lymphoid_int$Manual2 != "Doublet" & lymphoid_int$Manual2 != "Unassigned",]))
+DimPlot(lymphoid_int2, group.by = "Manual2", label =T) + NoAxes() + NoLegend()
+
+
+plot <- DimPlot(lymphoid_int2, group.by = "Manual2", label = TRUE)
+select.cells <- CellSelector(plot = plot)
+lymphoid_int2@meta.data[select.cells,]$Manual2 <- "Doublet"
+lymphoid_int2@meta.data[select.cells,]$Manual2 <- "T cells"
+saveRDS(lymphoid_int2,"lymphoid_lymphoid_int2_Manual2_rmDoubletManual.rds")
+
+lymphoid_int2 <- subset(lymphoid_int2, cells = row.names(lymphoid_int2@meta.data[lymphoid_int2$Manual2 != "Doublet",]))
+saveRDS(lymphoid_int2,"lymphoid_int_Manual2_noDoublets.rds")
+
+lymphoid_int2 <- readRDS("lymphoid_int_Manual2_noDoublets.rds")
+
+```
+
+```{r myeloid}
+pM0 <- DimPlot(myeloid_int, group.by = "BP.main", label = T) & NoAxes()
+pM0
+
+myeloid_markers <- FindAllMarkers(myeloid_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+myeloid_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top5
+heatmap5 <-DoHeatmap(myeloid_int, features = top5$gene) 
+heatmap5
+
+DefaultAssay(myeloid_int) <- "RNA"
+Idents(myeloid_int) <- "integrated_snn_res.0.5"
+
+list_genes <- c("MAMU-DRA","MAMU-DRB1","CD163","CD14","FCGR3","CD68","S100A8","APOBEC3A","APOE","MRC1","MARCO","TREM2","SIGLEC1","MSR1", "FABP4", "CCL18","XCR1","CLEC9A","CCDC50","IRF4","IRF8","SFTPA1","KIT","FLT3","EGFL7","CD3D","CD3E","NKG7","CCR7","DCN")
+
+Idents(myeloid_int) <- "integrated_snn_res.0.5"
+pM1 <- DimPlot(myeloid_int, group.by = "integrated_snn_res.0.5",label = T, raster = T) + NoAxes() + NoLegend()
+pM2 <- DotPlot(myeloid_int,features = list_genes) + coord_flip() 
+
+pM1 + pM2
+datapM2 <- pM2$data
+filename <- 'datapM2.xlsx'
+install.packages("writexl")
+write.xlsx(datapM2, filename)
+
+myeloid_int$Manual2 <- "NA"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "0"] <- "Neurtrophils"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "1"] <- "CD163+MRC1-"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "2"] <- "CD163+MRC1-"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "3"] <- "Non-classical Monocytes"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "4"] <- "CD163+MRC1+TREM2+"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "5"] <- "CD163-MRC1-" # similar GEX to AM cluster 10
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "6"] <- "CD163+MRC1+"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "7"] <- "cDC1"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "8"] <- "pDC" 
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "9"] <- "Doublet" #Epithelial 
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "10"] <-"CD163+MRC1+"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "11"] <-"Mast" 
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "12"] <-"cDC2"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "13"] <-"Doublet" # Endothelial
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "14"] <-"Unassigned" 
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "15"] <-"Doublet" # TNK
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "16"] <-"Activated DC"
+myeloid_int$Manual2[myeloid_int$integrated_snn_res.0.5 == "17"] <-"Doublet" # Fibroblasts
+
+
+pM3 <- DimPlot(myeloid_int, group.by = "Manual2",label = T, raster = T, repel = T) + NoAxes() + NoLegend()
+
+(pM1 / pM3) | pM2
+
+
+myeloid_int2 <- subset(myeloid_int, cells = row.names(myeloid_int@meta.data[myeloid_int$Manual2 != "Doublet" & myeloid_int$Manual2 != "Unassigned",]))
+DimPlot(myeloid_int2, group.by = "Manual2",label = TRUE, repel = T, raster = T) + NoAxes() + NoLegend()
+
+plot <- DimPlot(myeloid_int2, group.by = "Manual2", label = TRUE, repel = T, raster = T) + NoAxes() + NoLegend()
+select.cells <- CellSelector(plot = plot)
+myeloid_int2@meta.data[select.cells,]$Manual2 <- "Doublet"
+saveRDS(myeloid_int2,"myeloid_myeloid_int2_Manual2_rmDoubletManual.rds")
+myeloid_int2 <- subset(myeloid_int2, cells = row.names(myeloid_int2@meta.data[myeloid_int2$Manual2 != "Doublet",]))
+saveRDS(myeloid_int2,"myeloid_int_Manual2_noDoublets.rds")
+```
+
+```{r other}
+#Other cell types 
+other_markers <- FindAllMarkers(other_int,test.use = "MAST", only.pos = T, logfc.threshold = 0.25, min.pct = 0.25)
+other_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top5
+heatmap5 <-DoHeatmap(other_int, features = top5$gene) 
+heatmap5
+top5
+
+DefaultAssay(other_int) <- "RNA"
+Idents(other_int) <- "integrated_snn_res.0.5"
+list_genes <- c("KRT5", "IL7R","THBD","EDNRB","ICAM2","TNC","SPON2","LBH","MFAP4","G0S2","PDGFRB", "CPE","PRSS23", "GJA5","IGFBP3","HOPX","AGER","ACTA2","TAGLN","FBLN1","CCDC80","CD3D","CD3E","ADGRL4","CLU","SCX", "CD19", "MS4A1")
+
+pO1 <- DimPlot(other_int, group.by = "integrated_snn_res.0.5", label = T, repel = T, raster = T) + NoAxes() + NoLegend()
+pO2 <- DotPlot(other_int,dot.scale = 5,features = list_genes) + coord_flip() 
+
+pO1+ pO2
+
+datapO2 <- pO2$data
+filename <- 'datapO2.xlsx'
+write.xlsx(datapO2, filename)
+
+
+other_int$Manual2 <- "NA"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "0"] <- "Capillary"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "1"] <- "Capillary"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "2"] <- "Capillary aerocyte"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "3"] <- "Myofibroblast"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "4"] <- "Fibroblast"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "5"] <- "Capillary" #ISG heavy 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "6"] <- "Fibroblast"  
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "7"] <- "Pericyte"  
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "8"] <- "Capillary aerocyte" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "9"] <- "Capillary" #3 of top 10 genes are mitchondrial 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "10"] <- "Capillary" # also mito genes 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "11"] <- "Vein" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "12"] <- "Smooth Muscle"
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "13"] <- "Artery" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "14"] <- "Doublet" #Epithelial 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "15"] <- "Smooth Muscle" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "16"] <- "Capillary" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "17"] <- "Adventitial Fibroblast" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "18"] <- "Doublet" #TNK 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "19"] <- "Bronchial vessel" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "20"] <- "Fibromyocyte" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "21"] <- "Doublet" #B cell 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "22"] <- "Myofibroblast" 
+other_int$Manual2[other_int$integrated_snn_res.0.5 == "23"] <- "Fibroblast" 
+
+pO3 <- DimPlot(other_int, group.by = "Manual2", label = T, repel = T, raster = T) + NoAxes() + NoLegend()
+
+(pO1 / pO3) | pO2
+
+pO3
+other_int2 <- subset(other_int, cells = row.names(other_int@meta.data[other_int$Manual2 != "Doublet" & other_int$Manual2 != "Unassigned",]))
+pO2 <- DimPlot(other_int2, group.by = "Manual2")
+pO1 + pO2
+
+plot <- DimPlot(other_int2, group.by = "Manual2", label = TRUE)
+select.cells <- CellSelector(plot = plot)
+other_int2@meta.data[select.cells,]$Manual2 <- "Doublet"
+saveRDS(other_int2,"other_int_Manual2_rmDoubletManual.rds")
+
+other_int2 <- subset(other_int2, cells = row.names(other_int2@meta.data[other_int2$Manual2 != "Doublet",]))
+saveRDS(other_int2,"other_int_Manual2_noDoublets.rds")
+pO4 <- DimPlot(other_int2, group.by = "Manual2", label = T, repel = T, raster = T) + NoAxes() + NoLegend()
+pO4
+
+```
+
+```{r Add cell annotation main}
+
+int <- readRDS("int_classify_v1.rds")
+
+epithelial_int2 <- readRDS("epithelial_int_Manual2_noDoublets.rds")
+lymphoid_int2 <- readRDS("lymphoid_int_Manual2_noDoublets.rds")
+myeloid_int2 <- readRDS("myeloid_int_Manual2_noDoublets.rds")
+other_int2 <- readRDS("other_int_Manual2_noDoublets.rds")
+
+epithelial_meta <- epithelial_int2@meta.data[,c("Manual2"),drop=FALSE]
+lymphoid_meta <- lymphoid_int2@meta.data[,c("Manual2"),drop=FALSE]
+myeloid_meta <- myeloid_int2@meta.data[,c("Manual2"),drop=FALSE]
+other_meta <- other_int2@meta.data[,c("Manual2"),drop=FALSE]
+
+meta_new <- rbind(epithelial_meta,lymphoid_meta,myeloid_meta,other_meta)
+head(meta_new)
+
+int_clean <- subset(int_lungs_classify_v1, cells = row.names(meta_new))
+int_clean <- AddMetaData(int_clean, metadata = meta_new[colnames(int_clean),],col.name = "Manual2")
+
+DefaultAssay(int_clean) <- "RNA"
+int_clean <- NormalizeData(int_clean)
+int_clean <- FindVariableFeatures(int_clean, selection.method = "vst")
+int_clean <- ScaleData(int_clean)
+saveRDS(int_clean,"int_clean.rds")
+
+pc1 <- DimPlot(int_clean, group.by = "Type1",cols = c("#4daf4a","#377eb8","#e41a1c","#ff7f00","#FF00FF"),raster = T) & NoAxes()
+pc2 <- DimPlot(epithelial_int2, group.by = "Manual2", raster = T, label = T, repel = T, cols = colorRampPalette(brewer.pal(name="Set2", n = 5))(5)[1:5]) + theme(panel.border = element_rect(colour = "black", fill=NA, size=0.5)) + ggtitle("Epithelial") & NoLegend()  & NoAxes()
+pc3 <- DimPlot(other_int2, group.by = "Manual2", raster = T, label = T, repel = T,cols = colorRampPalette(brewer.pal(name="Set2", n = 8))(13)[1:13]) + theme(panel.border = element_rect(colour = "black", fill=NA, size=0.5)) + ggtitle("Other") & NoLegend() & NoAxes()
+pc4 <- DimPlot(myeloid_int2, group.by = "Manual2", raster = T, label = T, repel = T,cols = colorRampPalette(brewer.pal(name="Set2", n = 8))(12)[1:12]) + theme(panel.border = element_rect(colour = "black", fill=NA, size=0.5))+ ggtitle("Myeloid") & NoLegend()  & NoAxes()
+pc5 <- DimPlot(lymphoid_int2, group.by = "Manual2", raster = T, label = T, repel = T,cols = colorRampPalette(brewer.pal(name="Set2", n = 8))(8)[4:8]) + theme(panel.border = element_rect(colour = "black", fill=NA, size=0.5)) + ggtitle("Lymphoid") & NoLegend() & NoAxes()
+
+plot_clean <- pc1 | ((pc2+pc5)/(pc4+pc3))
+plot_clean
+
+```
+
+```{r DE}
+int_clean <- readRDS("int_clean.rds")
+
+
+animalIDValues <- int_clean$Sample[]
+dose<- character(length = 101766)
+
+for (i in 1:101766) {
+  nAnimalID <- animalIDValues[i]
+  if (is.na(nAnimalID)) {
+    dose[i] <- NA  
+  } else if (grepl("LM65|RVo18|RWo17|RJr18|RHv18|RAu18", nAnimalID)) {
+    dose[i] <- "PGT121"
+  } else if (grepl("RPb19|RNw18|RZn18|RJn18|RIn18|LM98", nAnimalID)) {
+    dose[i] <- "40.8_10mg"
+  } else if (grepl("RIL18|MB11|RBt18|RYu18|LL60|RGu18", nAnimalID)) {
+    dose[i] <- "40.8_1mg"
+  } else if (grepl("RWj18|RFu18|ROk18|RIr18|RUv18|ROt18", nAnimalID)) {
+    dose[i] <- "40.8_0.1mg"
+  }
+}
+
+int_clean$Group <- "NA"
+int_clean$Group <- dose
+
+int_clean$Type_Group <- paste0(int_clean$Manual2,"_",int_clean$Group)
+Idents(int_clean) <- "Type_Group" 
+DefaultAssay(int_clean) <- "RNA"
+
+saveRDS(int_clean,"int_clean_v2.rds")
+
+list_de1 <- list()
+list_de1_sig <- list()
+list_de10 <- list()
+list_de10_sig <- list()
+list_de101 <- list()
+list_de101_sig <- list()
+
+get_de <- function(type){
+  
+  print(type)
+  
+
+de1 <- FindMarkers(int_clean, ident.1 = paste0(type,"_PGT121"), ident.2= paste0(type,"_40.8_0.1mg"), test.use = "MAST")
+de10 <- FindMarkers(int_clean, ident.1 = paste0(type,"_PGT121"), ident.2= paste0(type,"_40.8_10mg"), test.use = "MAST")
+de101 <- FindMarkers(int_clean, ident.1 = paste0(type,"_40.8_10mg"), ident.2= paste0(type,"_40.8_0.1mg"), test.use = "MAST")
+
+write.table(de1,paste0(type),quote=F,sep="\t")
+list_de1[[paste0(type)]] <<- de1
+
+de1 <- de1[de1$p_val_adj < 0.05 & abs(de1$avg_log2FC) >= log2(1.5),]
+de1 <- de1[order(de1$avg_log2FC,decreasing = T),]
+write.table(de1,paste0(type),quote=F,sep="\t")
+list_de1_sig[[paste0(type)]] <<- de1
+
+
+write.table(de10,paste0(type),quote=F,sep="\t")
+list_de10[[paste0(type)]] <<- de10
+
+de10 <- de10[de10$p_val_adj < 0.05 & abs(de10$avg_log2FC) >= log2(1.5),]
+de10 <- de10[order(de10$avg_log2FC,decreasing = T),]
+write.table(de10,paste0(type),quote=F,sep="\t")
+list_de10_sig[[paste0(type)]] <<- de10
+
+write.table(de101,paste0(type),quote=F,sep="\t")
+list_de101[[paste0(type)]] <<- de101
+
+de101 <- de101[de101$p_val_adj < 0.05 & abs(de101$avg_log2FC) >= log2(1.5),]
+de101 <- de101[order(de101$avg_log2FC,decreasing = T),]
+write.table(de101,paste0(type),quote=F,sep="\t")
+list_de101_sig[[paste0(type)]] <<- de101
+
+}
+
+
+
+lapply(sort(unique(int_clean$Manual2)),get_de)
+
+saveRDS(list_de1,"list_de1.rds")
+saveRDS(list_de1_sig,"list_de1_sig.rds")
+saveRDS(list_de10,"list_de10.rds")
+saveRDS(list_de10_sig,"list_de10_sig.rds")
+saveRDS(list_de101,"list_de101.rds")
+saveRDS(list_de101_sig,"list_de101_sig.rds")
+
+write.xlsx(list_de1, file = "DE_single-cell_Lungs_Control_vs_low.xlsx", rowNames=T)
+write.xlsx(list_de1_sig, file = "DE_single-cell_Lungs_Control_vs_low_sig.xlsx", rowNames=T)
+write.xlsx(list_de10, file = "DE_single-cell_Lungs_Control_vs_10.xlsx", rowNames=T)
+write.xlsx(list_de10_sig, file = "DE_single-cell_Lungs_Control_vs_10_sig.xlsx", rowNames=T)
+write.xlsx(list_de101, file = "DE_single-cell_Lungs_10_vs_low.xlsx", rowNames=T)
+write.xlsx(list_de101_sig, file = "DE_single-cell_Lungs_10_vs_low_sig.xlsx", rowNames=T)
+
+```
+
+```{r ORA}
+install.packages("rvcheck")
+library(remotes)
+BiocManager::install("msigdbr")
+library("msigdbr")
+library(devtools)
+install_github("YuLab-SMU/clusterProfiler")
+
+
+
+m_t2g_reactome <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::select(gs_name, gene_symbol)
+
+m_t2g_biocarta <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:BIOCARTA") %>% 
+  dplyr::select(gs_name, gene_symbol)
+
+m_t2g_kegg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+  dplyr::select(gs_name, gene_symbol)
+
+m_t2g_h <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gs_name, gene_symbol)
+
+m_t2g <- bind_rows(m_t2g_reactome,m_t2g_h,m_t2g_biocarta,m_t2g_kegg)
+
+
+head(m_t2g)
+
+list_ora_PGT121 <- list()
+list_ora_10 <- list()
+list_ora_01 <- list()
+
+
+run_ora <- function(de,type){
+  print(type)
+  PGT121 <- enricher(row.names(de[de$avg_log2FC>0,]),TERM2GENE=m_t2g)
+  if(!is.null(PGT121)){
+    list_ora_PGT121[[type]] <<- PGT121@result
+  }
+  
+  cc40.8_10 <- enricher(row.names(de[de$avg_log2FC<0,]),TERM2GENE=m_t2g)
+  if(!is.null(cc40.8_10)){
+    list_ora_10[[type]] <<- cc40.8_10@result
+  }
+  cc40.8_01 <- enricher(row.names(de[de$avg_log2FC<0,]),TERM2GENE=m_t2g)
+  if(!is.null(cc40.8_01)){
+    list_ora_01[[type]] <<- cc40.8_01@result
+    
+  }
+}
+
+
+mapply(run_ora,list_de10_sig,names(list_de10_sig))
+
+all_ora_PGT121 <- bind_rows(list_ora_PGT121, .id = "column_label")
+all_ora_PGT121$Group <- "PGT121"
+all_ora_PGT121_sig <- all_ora_PGT121[all_ora_PGT121$p.adjust < 0.05,]
+
+all_ora_10<- bind_rows(list_ora_10, .id = "column_label")
+all_ora_10$Group <- "CC40.8_10"
+all_ora_10_sig <- all_ora_10[all_ora_10$p.adjust < 0.05,]
+
+write.table(all_ora_PGT121,"Lung_ORA_PGT121.txt",sep="\t", quote = F)
+write.table(all_ora_10,"Lung_ORA_10.txt",sep="\t", quote = F)
+
+#short ORA
+
+t1 <- table(all_ora_PGT121_sig$ID,all_ora_PGT121_sig$column_label)
+write.table(t1,"all_ora_PGT121_ORA_pathways_celltypes.txt",sep="\t", quote = F)
+t1
+shortlist <- c("REACTOME_INTERFERON_SIGNALING",
+               "KEGG_RIG_I_LIKE_RECEPTOR_SIGNALING_PATHWAY",
+               "REACTOME_HSF1_DEPENDENT_TRANSACTIVATION",
+               "REACTOME_CELLULAR_RESPONSE_TO_HEAT_STRESS",
+               "HALLMARK_APOPTOSIS",
+               "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+               "HALLMARK_COMPLEMENT",
+               "REACTOME_REGULATION_OF_HSF1_MEDIATED_HEAT_SHOCK_RESPONSE",
+               "REACTOME_REGULATED_NECROSIS",
+               "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+               "HALLMARK_INFLAMMATORY_RESPONSE",
+               "REACTOME_DNA_DAMAGE_BYPASS",
+               "REACTOME_HSP90_CHAPERONE_CYCLE_FOR_STEROID_HORMONE_RECEPTORS_SHR_IN_THE_PRESENCE_OF_LIGAND",
+               "REACTOME_RIPK1_MEDIATED_REGULATED_NECROSIS",
+               "REACTOME_PROGRAMMED_CELL_DEATH",
+               "REACTOME_INTERLEUKIN_1_SIGNALING",
+               "REACTOME_INTERLEUKIN_27_SIGNALING",
+               "REACTOME_INTERLEUKIN_6_SIGNALING")
+
+
+all_ora_10 <- as.data.frame(all_ora_10)
+all_ora_PGT121 <- as.data.frame(all_ora_PGT121)
+all_ora_PGT121_CC40.8 <- rbind(all_ora_PGT121,all_ora_10)
+
+keep <- all_ora_PGT121_CC40.8$ID %in% shortlist
+all_ora_PGT121_CC40.8_short <- all_ora_PGT121_CC40.8[keep,]
+
+all_ora_PGT121_CC40.8_short$Type_Time_Group <- paste0(all_ora_PGT121_CC40.8_short$column_label,"_",all_ora_PGT121_CC40.8_short$Group)
+
+
+all_ora_PGT121_CC40.8_short$ID1 <- strtrim(all_ora_PGT121_CC40.8_short$ID,40)
+all_ora_PGT121_CC40.8_short$ID1 <- factor(all_ora_PGT121_CC40.8_short$ID1, levels = rev(strtrim(as.character(shortlist),40)))
+
+
+
+
+
+
+
+
+
+d1 <- as.data.frame(table(epithelial_int2$Manual2))  
+d1 <- as.character(d1[order(d1$Freq,decreasing = T),]$Var1)
+
+d2 <- as.data.frame(table(myeloid_int2$Manual2))  
+d2 <- as.character(d2[order(d2$Freq,decreasing = T),]$Var1)
+
+d3 <- as.data.frame(table(lymphoid_int2$Manual2))  
+d3 <- as.character(d3[order(d3$Freq,decreasing = T),]$Var1)
+
+d4 <- as.data.frame(table(other_int2$Manual2))
+d4 <- as.character(d4[order(d4$Freq,decreasing = T),]$Var1)
+
+
+df1 <- data.frame("Index" = c(1:length(unique(int_clean$Manual2))),"Type"=c(d1,d2,d3,d4))
+df2 <- df1
+df1$Type <- paste0(df1$Type,"_PGT121")
+df2$Type <- paste0(df2$Type,"_CC40.8_10")
+
+df <- rbind(df1,df2)
+df <- df[order(df$Index),]
+
+df$Type <- gsub("Untreated","Control",df$Type)
+
+levels_main <- df$Type[!grepl("Basal|Ciliated|Plasma|Mast|B cells|Activated|Fibromyocyte|Neurtrophils|Mesothelial|Lymphatic|Bronchial|Vein|Artery|Fibromyocete|CD163-",df$Type)]
+levels_main
+
+all_main <- all_ora_PGT121_CC40.8_short[all_ora_PGT121_CC40.8_short$Type_Time_Group %in% levels_main,]
+all_main$Type_Time_Group <- factor(all_main$Type_Time_Group, levels = levels_main)
+
+all_main$Type_Time_Group
+
+ 
+all_main_plot <- ggplot(all_main,aes(x=Type_Time_Group,y=ID1)) +
+  geom_point(aes(size = Count, fill = p.adjust),shape = 21) + 
+  theme_bw() +
+  scale_fill_gradient(low="red",high="blue") +
+  theme(axis.text.x = element_text(size=11,color = rep(c("#ff8c69","#00578b"),19))) +
+  theme(axis.text.y = element_text(size=9, color = "black")) +
+  geom_vline(xintercept = seq(2.5,36,by=2), linetype="dashed") +
+  geom_vline(xintercept = c(4.5,18.5,22.5)) +
+  ylab("Gene set")+
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm")) +
+  scale_x_discrete(labels = rep(c("-","+"),38), drop = FALSE)  + coord_cartesian(clip = "off") +
+  annotate("text", angle= 40,hjust = 0,vjust = -0.5, y = 19, x = seq(1.5,36, by = 2), 
+           label = unique(gsub("_.*","",levels_main)))  
+all_main_plot
+
+ggsave(plot = all_main_plot, file = "/ORA_Lung_Main.pdf",width = 49, height = 6, units = "in")
+
+
+
+
+```
+
+```{r data dotplots}
+isg <- c("CXCL10","GBP3","GBP2","IFI27","IFI44L","IFI6", "IFIT1","IFIT2","IFIT3","IRF7","IRF1","ISG15","ISG20","MX1","MX2","OAS1","OAS2","STAT1", "IDO1")
+cytokines <- c("IFNB1","IFNG","IL10","IL15","IL1B","IL6","IL7","TNF")
+chemokines <- c("CCL2","CCL22","CCL3","CCL4L1","CCL5","CCL8","CCL18","CXCL3","CXCL8","CXCL9","CXCL10","CXCL11")
+pcd <- c("UBB", "YWHAH","PSME2", "IRF1", "TNFSF10", "PMSA3","DAPk1", "HSP90AA1", "PSMA2,", "CASP1", "KPNB1", "PSMB9", "PSMB8", "PSMB10", "MLKL", "CFLAR", "GSN")
+inflammasome <- c("IL1RN","IL1B","IL18","NLRP3","GSDMD","CASP1","AIM2", "PYCARD")
+heat_stress <- c("TNFRSF21", "CRYAB", "HSPA5", "DNAJB6", "FKBP4", "UBB", "BAG3", "HSP90AA1", "HSPA8", "HSPH1", "HSPB1", "DNAJB1")
+
+
+
+epithelial_int2 <- readRDS("epithelial_int_Manual2_noDoublets.rds")
+lymphoid_int2 <- readRDS("lymphoid_int_Manual2_noDoublets.rds")
+myeloid_int2 <- readRDS("myeloid_int_Manual2_noDoublets.rds")
+other_int2 <- readRDS("other_int_Manual2_noDoublets.rds")
+
+int_clean <- readRDS("int_clean_v2.rds")
+
+
+
+# Order cell types
+d1 <- as.data.frame(table(epithelial_int2$Manual2))  
+d1 <- as.character(d1[order(d1$Freq,decreasing = T),]$Var1)
+d1
+
+d2 <- as.data.frame(table(myeloid_int2$Manual2))  
+d2 <- as.character(d2[order(d2$Freq,decreasing = T),]$Var1)
+d2
+
+d3 <- as.data.frame(table(lymphoid_int2$Manual2))  
+d3 <- as.character(d3[order(d3$Freq,decreasing = T),]$Var1)
+d3
+
+d4 <- as.data.frame(table(other_int2$Manual2))
+d4 <- as.character(d4[order(d4$Freq,decreasing = T),]$Var1)
+d4
+
+new_order<- paste0(rep(c(d1,d2,d3,d4),each = 3),c("_PGT121","_40.8_0.1mg","_40.8_10mg"))
+
+
+int_clean$Type_Group <- factor(int_clean$Type_Group, 
+                                        levels = new_order)
+Idents(int_clean) <- "Type_Group"
+
+summary(int_clean$Type_Group)
+
+
+pI <- DotPlot(int_clean, features = isg, assay = "RNA") +  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black",angle = 90, hjust = 1,vjust = 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69","#48A860", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(3.5,90,by=3), linetype="dashed") +
+  geom_hline(yintercept = c(12.5,45.5,57.5,90.5)) +
+  geom_vline(xintercept = c(18.59)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 19, y = seq(1.5,90, by = 3), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","Low", "High"),64))
+pI
+
+# Inflammasome
+p1 <- DotPlot(int_clean, features = inflammasome, assay = "RNA",dot.scale = 4) + coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black", angle = 90, hjust = 1, vjust= 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69","#48A860", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(3.5,90,by=3), linetype="dashed") +
+  geom_hline(yintercept = c(12.5,45.5,57.5,90.5)) +
+  geom_vline(xintercept = c(8.5)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 9, y = seq(1.5,90, by = 3), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","Low", "High"),64))
+p1
+#Chemokines
+
+p2 <- DotPlot(int_clean, features = chemokines, assay = "RNA",dot.scale = 4) + coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black", angle = 90, hjust = 1, vjust= 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69","#48A860", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(3.5,90,by=3), linetype="dashed") +
+  geom_hline(yintercept = c(12.5,45.5,57.5,90.5)) +
+  geom_vline(xintercept = c(12.5)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 13, y = seq(1.5,90, by = 3), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","Low", "High"),64))
+p2
+
+# Programmed cell death
+
+p3 <- DotPlot(int_clean, features = pcd, assay = "RNA",dot.scale = 4) + coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black", angle = 90, hjust = 1, vjust= 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69","#48A860", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(3.5,90,by=3), linetype="dashed") +
+  geom_hline(yintercept = c(12.5,45.5,57.5,90.5)) +
+  geom_vline(xintercept = c(14.5)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 15, y = seq(1.5,90, by = 3), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","Low", "High"),64))
+p3
+
+p4 <- DotPlot(int_clean, features = cytokines, assay = "RNA",dot.scale = 4) + coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black", angle = 90, hjust = 1, vjust= 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69","#48A860", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(3.5,90,by=3), linetype="dashed") +
+  geom_hline(yintercept = c(12.5,45.5,57.5,90.5)) +
+  geom_vline(xintercept = c(8.5)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 9, y = seq(1.5,90, by = 3), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","Low", "High"),64))
+p4
+
+#remake without 0.1mg/kg groups 
+subset_rows <- grepl("PGT121|40.8_10mg", int_clean$Type_Group)
+
+# Subset the data based on identified rows
+int_clean_filtered <- int_clean[, subset_rows]
+summary(factor(int_clean_filtered$Type_Group))
+
+int_clean_filtered$Type_Group <- factor(int_clean_filtered$Type_Group, 
+                               levels = new_order)
+Idents(int_clean_filtered) <- "Type_Group"
+
+summary(int_clean_filtered$Type_Group)
+#ISG dotplot
+
+pI <- DotPlot(int_clean_filtered, features = isg, assay = "RNA") +  coord_flip(clip = "off") +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  theme(axis.text.x = element_text(size=11, color = "black",angle = 90, hjust = 1,vjust = 0)) +
+  theme(axis.text.x = element_text(size=11, color = rep(c("#ff8c69", "#00578b")))) +
+  theme(axis.text.y = element_text(size=11)) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_hline(yintercept = seq(2.5,60,by=2), linetype="dashed") +
+  geom_hline(yintercept = c(8.5,30.5,38.5,60.5)) +
+  geom_vline(xintercept = c(18.59)) +
+  theme(plot.margin = unit(c(3.5,1,1,1), "cm"))+ 
+  annotate("text", angle= 45,hjust = 0,vjust = 0.5, x = 19, y = seq(1,60, by = 2), 
+           label = unique(gsub("_.*","",new_order))) +
+  scale_y_discrete(labels = rep(c("PGT121","High"),64))
+pI
+
+```
+
+```{r Sig Genes}
+# PGT121 vs CC40.8 0.1 mg/kg
+tmp_list1 <- list_de1_sig[(names(list_de1_sig))]
+tmp_list1
+num_isg <- list()
+get_num <- function(de,cell){
+  print(cell)
+  print(sum(row.names(de) %in% isg))
+}
+
+as.data.frame(mapply(get_num,tmp_list1,names(tmp_list1)))
+
+# PGT121 vs CC40.8 10 mg/kg
+tmp_list10 <- list_de10_sig[(names(list_de10_sig))]
+tmp_list10
+num_isg <- list()
+get_num <- function(de,cell){
+  print(cell)
+  print(sum(row.names(de) %in% isg))
+}
+
+as.data.frame(mapply(get_num,tmp_list10,names(tmp_list10)))
+
+# CC40.8 10 mg/kg vs CC40.8 0.1 mg/kg
+tmp_list101 <- list_de101_sig[(names(list_de101_sig))]
+tmp_list101
+num_isg <- list()
+get_num <- function(de,cell){
+  print(cell)
+  print(sum(row.names(de) %in% isg))
+}
+
+as.data.frame(mapply(get_num,tmp_list101,names(tmp_list101)))
+
+
+```
