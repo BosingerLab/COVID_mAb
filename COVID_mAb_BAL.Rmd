@@ -7,7 +7,6 @@ date: "2024-06-20"
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
 library(Seurat)
 library(SingleR)
 library(stringr)
@@ -30,14 +29,14 @@ install.packages("celldex")
 install.packages("SingleR")
 
 ref <- BlueprintEncodeData()
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
+
 y_genes <- as.character(unlist(read.table("Y_genes.txt"),use.names = F))
 mt_genes <-  as.character(unlist(read.table("MT_genes.txt"),use.names = F))
 ig_genes <- as.character(unlist(read.table("IG_genes.txt"),use.names = F))
 tr_genes <- as.character(unlist(read.table("TR_genes.txt"),use.names = F))
 prot_coding <- as.character(unlist(read.table("protein_coding_seurat.txt"),use.names = F))
 
-data_path <- "/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL"  
+data_path <- "~/COVID_mAb/Processing/BAL"  
 
 dirs <- list.dirs(data_path, recursive = FALSE)
 dirs <- dirs[grepl("Mmul10_MT246667", dirs)]
@@ -51,7 +50,7 @@ dirs
 ```{r preprocessing}
 #QC
 
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL")
+
 
 list_obj <- list()
 list_obj2 <- list() 
@@ -214,7 +213,7 @@ saveRDS(list_obj2,"BAL_list_objects_all.rds")
 ```
 
 ```{r Demultiplexing}
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/BAL")
+
 runDEMUX <- function(obj){
   s <- unique(obj$Sample)
   DefaultAssay(obj) = "HTO"
