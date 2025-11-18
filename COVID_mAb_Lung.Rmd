@@ -5,7 +5,6 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
 library(Seurat)
 library(SingleR)
 library(stringr)
@@ -25,20 +24,18 @@ if(length(new.packages)) install.packages(new.packages)
 
 
 ref <- BlueprintEncodeData()
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/NHP_COVID-19_2-main")
 y_genes <- as.character(unlist(read.table("Y_genes.txt"),use.names = F))
 mt_genes <-  as.character(unlist(read.table("MT_genes.txt"),use.names = F))
 ig_genes <- as.character(unlist(read.table("IG_genes.txt"),use.names = F))
 tr_genes <- as.character(unlist(read.table("TR_genes.txt"),use.names = F))
 prot_coding <- as.character(unlist(read.table("protein_coding_seurat.txt"),use.names = F))
 
-data_path <- "/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/Lung"  
+data_path <- "~/COVID_mAb/Processing/Lung"  
 
 dirs <- list.dirs(data_path, recursive = FALSE)
 dirs <- dirs[grepl("Mmul10_MT246667", dirs)]
 dirs
 
-setwd("/yerkes-cifs/runs/Analysis_BLab/Chris/COVID_mAb/Processing/Lung")
 list_obj_lung <- list()
 ```
 
